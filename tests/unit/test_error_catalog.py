@@ -13,9 +13,9 @@ _SPEC_URIS = {
     "/errors/insufficient-funds": 422,
     "/errors/currency-mismatch": 422,
     "/errors/account-not-found": 404,
-    # /errors/idempotency-key-reuse and /errors/rate-limited are reserved
-    # for Phase 3 and Phase 7 respectively; not yet raised anywhere.
     "/errors/idempotency-conflict": 409,
+    "/errors/idempotency-key-reuse": 422,
+    # /errors/rate-limited is reserved for Phase 7; not yet raised anywhere.
     "/errors/already-reversed": 409,
 }
 
@@ -55,3 +55,17 @@ def test_extra_is_json_safe() -> None:
 
     exc = errors_module.AccountNotFound("not found", account_id=uuid.uuid4())
     assert isinstance(exc.as_problem_members()["account_id"], str)
+
+
+def test_problem_headers_are_str_to_str() -> None:
+    for cls in _all_ledger_error_subclasses():
+        headers = cls("detail").problem_headers()
+        assert isinstance(headers, dict)
+        for key, value in headers.items():
+            assert isinstance(key, str)
+            assert isinstance(value, str)
+
+
+def test_idempotency_conflict_sets_retry_after() -> None:
+    exc = errors_module.DuplicateTransaction("in flight")
+    assert exc.problem_headers() == {"Retry-After": "1"}

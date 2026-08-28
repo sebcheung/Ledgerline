@@ -84,6 +84,7 @@ async def _ledger_error_handler(request: Request, exc: Exception) -> JSONRespons
         status=exc.status,
         detail=exc.detail,
         extra=exc.as_problem_members(),
+        headers=exc.problem_headers() or None,
     )
 
 
