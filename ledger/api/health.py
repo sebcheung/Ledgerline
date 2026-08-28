@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from alembic.config import Config
@@ -7,6 +8,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger.db.session import get_session
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -26,19 +29,22 @@ async def healthz() -> dict[str, str]:
 
 @router.get("/readyz")
 async def readyz(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
+    # HTTPException.detail keys use `reason`, not `status` -- the RFC 7807
+    # problem document reserves `status` for the integer HTTP status code,
+    # and `_http_exception_handler` merges this dict's keys in as top-level
+    # extension members.
     try:
         await session.execute(text("SELECT 1"))
         result = await session.execute(text("SELECT version_num FROM alembic_version"))
         current = result.scalar_one_or_none()
     except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail={"status": "database_unreachable", "error": str(exc)}
-        ) from exc
+        logger.error("readyz database check failed", exc_info=exc)
+        raise HTTPException(status_code=503, detail={"reason": "database_unreachable"}) from exc
 
     head = ScriptDirectory.from_config(_alembic_config()).get_current_head()
     if current != head:
         raise HTTPException(
             status_code=503,
-            detail={"status": "migration_pending", "current": current, "head": head},
+            detail={"reason": "migration_pending", "current": current, "head": head},
         )
     return {"status": "ok"}
