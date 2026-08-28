@@ -1,7 +1,16 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ledger.models.base import Base, CreatedAtMixin, UUIDPKMixin
@@ -20,6 +29,7 @@ class WebhookDelivery(Base, UUIDPKMixin, CreatedAtMixin):
     __tablename__ = "webhook_deliveries"
     __table_args__ = (
         UniqueConstraint("event_id", "endpoint_id", name="uq_webhook_deliveries_event_endpoint"),
+        Index("ix_webhook_deliveries_status_next_attempt", "status", "next_attempt_at"),
     )
 
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("outbox_events.id"), nullable=False)
