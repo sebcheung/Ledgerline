@@ -24,6 +24,7 @@ inside the route handler, means it only happens once FastAPI has already
 accepted the request body.
 """
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Generic, TypeVar
@@ -45,6 +46,8 @@ from ledger.core.idempotency import (
     load_key,
     release_key,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Bump if the stored envelope shape ever changes; an unrecognized version
 #: found in an old row should be handled explicitly by the reader, not
@@ -148,6 +151,7 @@ class IdempotentRequest:
             # transaction still holds account_balances FOR UPDATE locks
             # from its own step 3 -- roll back before doing anything else.
             await self.session.rollback()
+            logger.info("idempotency.duplicate_backstop", extra={"idempotency_key": self.key})
             raise await self._resolve_duplicate() from None
         except Exception:
             await self.session.rollback()
