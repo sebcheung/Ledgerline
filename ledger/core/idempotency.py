@@ -28,6 +28,7 @@ for where the crux commit actually happens.
 
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,6 +50,8 @@ from ledger.core.errors import (
 )
 from ledger.models.enums import IdempotencyStatus
 from ledger.models.idempotency import IdempotencyKey
+
+logger = logging.getLogger(__name__)
 
 #: SPEC.md §6: reclaiming a stale lock races with the possibility that the
 #: original request is still mid-flight. The claim row can vanish between
@@ -173,6 +176,7 @@ async def claim_key(
         inserted = (await session.execute(insert_stmt)).one_or_none()
         if inserted is not None:
             await session.commit()
+            logger.info("idempotency.claimed", extra={"idempotency_key": key, "endpoint": endpoint})
             return Claim(
                 outcome=ClaimOutcome.EXECUTE,
                 key=key,
@@ -222,6 +226,7 @@ async def claim_key(
         if row.status == IdempotencyStatus.COMPLETED:
             await session.rollback()
             if row.request_fingerprint == fingerprint:
+                logger.info("idempotency.replayed", extra={"idempotency_key": key})
                 return Claim(
                     outcome=ClaimOutcome.REPLAY,
                     key=key,
@@ -238,6 +243,7 @@ async def claim_key(
         # status == IN_PROGRESS
         if not row.is_stale:
             await session.rollback()
+            logger.info("idempotency.conflict", extra={"idempotency_key": key})
             raise IdempotencyConflict(
                 f"a request with idempotency key {key!r} is already in progress",
                 idempotency_key=key,
@@ -259,6 +265,7 @@ async def claim_key(
         )
         reclaimed = (await session.execute(reclaim_stmt)).one()
         await session.commit()
+        logger.info("idempotency.reclaimed", extra={"idempotency_key": key, "endpoint": endpoint})
         return Claim(
             outcome=ClaimOutcome.EXECUTE,
             key=key,
@@ -330,6 +337,7 @@ async def release_key(session: AsyncSession, *, key: str, locked_at: datetime) -
         )
     )
     await session.commit()
+    logger.info("idempotency.released", extra={"idempotency_key": key})
 
 
 async def load_key(session: AsyncSession, *, key: str, fingerprint: str) -> StoredResponse | None:
