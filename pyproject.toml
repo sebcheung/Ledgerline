@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ledgerline"
+version = "0.1.0"
+description = "Idempotent payments ledger and reconciliation engine"
+requires-python = ">=3.12,<3.13"
+readme = "README.md"
+license = { file = "LICENSE" }
+
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.5,<3",
+  "sqlalchemy[asyncio]>=2.0.35,<2.1",
+  "asyncpg>=0.29,<0.30",
+  "alembic>=1.13,<2",
+  "uvicorn[standard]>=0.30,<0.31",
+  "structlog>=24.4,<25",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6,<0.7",
+  "mypy>=1.11,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<0.25",
+  "hypothesis>=6.112,<7",
+  "testcontainers[postgres]>=4.8,<5",
+  "httpx>=0.27,<0.28",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ledger", "worker", "dashboard"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+# B008: FastAPI's Depends(...) in a default argument is the standard pattern, not a bug.
+extend-ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ledger", "worker", "dashboard"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "migrations.*"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: requires a running or testcontainers-provisioned Postgres",
+]
