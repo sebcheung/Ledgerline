@@ -12,6 +12,7 @@ web framework.
 """
 
 import uuid
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 
@@ -32,6 +33,12 @@ class LedgerError(Exception):
     title: ClassVar[str]
     status: ClassVar[int]
 
+    #: Extra HTTP response headers this error type always sets (e.g.
+    #: `Retry-After`). Empty by default -- a method rather than a bare
+    #: ClassVar read so a subclass (e.g. Phase 7's rate limiter) can compute
+    #: a dynamic value without changing the call site.
+    headers: ClassVar[Mapping[str, str]] = {}
+
     def __init__(self, detail: str, **extra: Any) -> None:
         super().__init__(detail)
         self.detail = detail
@@ -40,6 +47,10 @@ class LedgerError(Exception):
     def as_problem_members(self) -> dict[str, Any]:
         """JSON-safe extension members for the RFC 7807 problem document."""
         return dict(self.extra)
+
+    def problem_headers(self) -> dict[str, str]:
+        """Extra HTTP headers to attach to the RFC 7807 response."""
+        return dict(self.headers)
 
 
 class UnbalancedTransaction(LedgerError):
@@ -90,14 +101,69 @@ class AlreadyReversed(LedgerError):
 
 class DuplicateTransaction(LedgerError):
     """Raised when the `transactions.idempotency_key` unique constraint
-    fires. Deliberately reuses `/errors/idempotency-conflict` rather than a
-    new URI -- SPEC.md §9's table already has this slot, and SPEC.md §6
-    makes this the layer that turns the backstop into a stored-response
-    replay in Phase 3."""
+    fires -- either because a caller bypassed the idempotency layer
+    entirely, or because Phase 3's `run()` reclaimed a stale lock while the
+    original request was still in flight and lost the race on the INSERT.
+    Deliberately owns `/errors/idempotency-conflict` (and its `Retry-After`
+    header) as SPEC.md §9's single 409 idempotency slot -- the in-flight
+    lock conflict described in SPEC.md §6 is the same client-facing signal
+    (retry), so `ledger.core.idempotency` imports this class under the
+    alias `IdempotencyConflict` rather than declaring a second URI. Phase
+    3's `run()` intercepts this exception via the session's SAVEPOINT (see
+    `posting.py`'s `begin_nested()`) and turns it into a stored-response
+    replay before it ever reaches a caller directly; it only surfaces as-is
+    to code that writes `idempotency_key` without going through that layer
+    (e.g. Phase 4's resolver)."""
 
     error_type = "/errors/idempotency-conflict"
     title = "Idempotency conflict"
     status = 409
+    headers: ClassVar[Mapping[str, str]] = {"Retry-After": "1"}
+
+
+class IdempotencyKeyReuse(LedgerError):
+    """SPEC.md §6: the same `(key, endpoint)` was reused with a request body
+    whose canonical fingerprint does not match the one stored for that key
+    -- either the original completed with a different body, or a stale lock
+    was reclaimed with a different body."""
+
+    error_type = "/errors/idempotency-key-reuse"
+    title = "Idempotency key reuse"
+    status = 422
+
+
+class IdempotencyKeyScopeConflict(LedgerError):
+    """Extension: SPEC.md §6 names this condition ("if row.endpoint !=
+    endpoint") but §9's error table gives it no URI -- the same key was
+    presented against a different route than the one it was first claimed
+    for."""
+
+    error_type = "/errors/idempotency-key-scope-conflict"
+    title = "Idempotency key scope conflict"
+    status = 422
+
+
+class IdempotencyStateError(LedgerError):
+    """Extension: the idempotency protocol reached a state SPEC.md §6 does
+    not anticipate -- e.g. `complete_key` found no matching `in_progress`
+    row to update. This is a server-side invariant violation, not a client
+    error; it always fails the enclosing transaction closed."""
+
+    error_type = "/errors/idempotency-state"
+    title = "Idempotency state error"
+    status = 500
+
+
+class InvalidRequestBody(LedgerError):
+    """Extension: `ledger.core.idempotency.canonical_hash` was asked to
+    fingerprint a body that is not valid JSON. Unreachable through the API
+    today -- FastAPI's own body parsing rejects a malformed request before
+    any dependency runs -- but every caller of `canonical_hash` must have a
+    typed failure mode to raise."""
+
+    error_type = "/errors/invalid-request-body"
+    title = "Invalid request body"
+    status = 400
 
 
 class InvalidMoney(LedgerError):
