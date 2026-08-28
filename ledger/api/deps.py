@@ -15,18 +15,20 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
 def get_idempotency_key(
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", min_length=1, max_length=255)
+    ] = None,
 ) -> str | None:
     """Read the client-supplied idempotency key, if any.
 
-    Phase 2 passes this straight through to `post_transaction`/
-    `reverse_transaction`, so the `transactions.idempotency_key` unique
-    constraint backstop (SPEC.md §5 step 6) is live even before Phase 3's
-    full protocol (claim/replay/stale-lock reclamation) exists. Phase 3
-    replaces this dependency with one that implements that full protocol,
-    without changing the service-layer signature.
+    Optional -- a request with no key executes directly, protected only by
+    the `transactions.idempotency_key` unique constraint backstop (SPEC.md
+    §5 step 6), same as Phase 2. Capped at 255 chars: `idempotency_keys.key`
+    is this column's primary key, and an unbounded header is a cheap way to
+    bloat that index; an over-long key 422s here as ordinary header
+    validation, before any dependency that would touch the database runs.
+
+    `ledger.api.idempotent.get_idempotent_request` wraps this key with the
+    fingerprint and claim/replay/reclaim protocol from SPEC.md §6.
     """
     return idempotency_key
-
-
-IdempotencyKeyDep = Annotated[str | None, Depends(get_idempotency_key)]

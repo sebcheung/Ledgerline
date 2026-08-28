@@ -4,7 +4,8 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Response
 from sqlalchemy import select
 
-from ledger.api.deps import IdempotencyKeyDep, SessionDep
+from ledger.api.deps import SessionDep
+from ledger.api.idempotent import IdempotencyDep, IdempotentResult
 from ledger.core.errors import TransactionNotFound
 from ledger.core.posting import EntryRequest, post_transaction, reverse_transaction
 from ledger.models.entries import Entry
@@ -90,19 +91,29 @@ async def create_transaction(
     payload: TransactionCreate,
     session: SessionDep,
     response: Response,
-    idempotency_key: IdempotencyKeyDep,
+    idem: IdempotencyDep,
 ) -> TransactionRead:
-    posted = await post_transaction(
-        session,
-        [EntryRequest(e.account_id, e.direction, e.amount, e.currency) for e in payload.entries],
-        idempotency_key=idempotency_key,
-        external_ref=payload.external_ref,
-        description=payload.description,
-        source=TransactionSource.API,
-    )
-    await session.commit()
-    response.headers["Location"] = f"/v1/transactions/{posted.id}"
-    return TransactionRead.model_validate(posted)
+    async def execute() -> IdempotentResult[TransactionRead]:
+        posted = await post_transaction(
+            session,
+            [
+                EntryRequest(e.account_id, e.direction, e.amount, e.currency)
+                for e in payload.entries
+            ],
+            idempotency_key=idem.key,
+            external_ref=payload.external_ref,
+            description=payload.description,
+            source=TransactionSource.API,
+        )
+        return IdempotentResult(
+            status=201,
+            body=TransactionRead.model_validate(posted),
+            headers={"Location": f"/v1/transactions/{posted.id}"},
+        )
+
+    result = await idem.run(execute)
+    response.headers.update(result.headers)
+    return result.body
 
 
 @router.get("/transactions/{transaction_id}", response_model=TransactionRead)
@@ -169,9 +180,16 @@ async def reverse(
     transaction_id: uuid.UUID,
     session: SessionDep,
     response: Response,
-    idempotency_key: IdempotencyKeyDep,
+    idem: IdempotencyDep,
 ) -> TransactionRead:
-    posted = await reverse_transaction(session, transaction_id, idempotency_key=idempotency_key)
-    await session.commit()
-    response.headers["Location"] = f"/v1/transactions/{posted.id}"
-    return TransactionRead.model_validate(posted)
+    async def execute() -> IdempotentResult[TransactionRead]:
+        posted = await reverse_transaction(session, transaction_id, idempotency_key=idem.key)
+        return IdempotentResult(
+            status=201,
+            body=TransactionRead.model_validate(posted),
+            headers={"Location": f"/v1/transactions/{posted.id}"},
+        )
+
+    result = await idem.run(execute)
+    response.headers.update(result.headers)
+    return result.body

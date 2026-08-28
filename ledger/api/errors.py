@@ -22,6 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ledger.api.idempotent import IdempotentReplay
 from ledger.core.errors import LedgerError
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,17 @@ async def _http_exception_handler(request: Request, exc: Exception) -> JSONRespo
     )
 
 
+async def _idempotent_replay_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Serve a stored response for a replayed idempotent request. Not
+    `application/problem+json` -- this is the original success response,
+    re-served, with `Idempotent-Replay: true` layered on top of whatever
+    headers (e.g. `Location`) the original response carried."""
+    assert isinstance(exc, IdempotentReplay)
+    logger.info("idempotency_replay")
+    headers = {**exc.envelope.get("headers", {}), "Idempotent-Replay": "true"}
+    return JSONResponse(exc.envelope.get("body"), status_code=exc.status, headers=headers)
+
+
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error("unhandled_exception", exc_info=exc)
     return problem_response(
@@ -168,4 +180,5 @@ def register_error_handlers(app: FastAPI) -> None:
 
     app.add_exception_handler(PydanticValidationError, _pydantic_validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
+    app.add_exception_handler(IdempotentReplay, _idempotent_replay_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)
