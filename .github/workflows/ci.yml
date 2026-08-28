@@ -21,6 +21,7 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgresql+asyncpg://ledgerline:ledgerline@localhost:5432/ledgerline
+      HYPOTHESIS_PROFILE: ci
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,6 +29,18 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: ruff check .
+      - run: ruff format --check .
       - run: mypy .
       - run: alembic upgrade head
-      - run: pytest
+      # Prove the downgrade path (which drops the append-only trigger) works
+      # before a later phase stacks another migration on top of it.
+      - run: alembic downgrade base
+      - run: alembic upgrade head
+      - run: alembic check
+      - name: Restore hypothesis example database
+        uses: actions/cache@v4
+        with:
+          path: .hypothesis
+          key: hypothesis-${{ hashFiles('tests/property/**') }}
+          restore-keys: hypothesis-
+      - run: pytest --cov=ledger --cov-report=term-missing --cov-fail-under=90
