@@ -66,6 +66,7 @@ timeout = 120
 markers = [
   "integration: requires a running or testcontainers-provisioned Postgres",
   "slow: multi-second concurrency test or high-example-count property test",
+  "fault: fault-injection test (SPEC.md §10)",
 ]
 filterwarnings = [
   "error",
