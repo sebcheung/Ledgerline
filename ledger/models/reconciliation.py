@@ -36,9 +36,7 @@ class ReconciliationRun(Base, UUIDPKMixin):
 class ReconciliationFinding(Base, UUIDPKMixin):
     __tablename__ = "reconciliation_findings"
 
-    run_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("reconciliation_runs.id"), nullable=False
-    )
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("reconciliation_runs.id"), nullable=False)
     finding_type: Mapped[ReconciliationFindingType] = mapped_column(
         pg_enum(ReconciliationFindingType, "reconciliation_finding_type"), nullable=False
     )
