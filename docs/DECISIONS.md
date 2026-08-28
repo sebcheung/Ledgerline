@@ -162,3 +162,68 @@ Each entry: what was chosen, what was rejected, why.
 **Rejected:** wrapping each test in an outer transaction and rolling back.
 **Why:** the concurrency tests require genuinely separate, concurrently-open Postgres transactions taking real row locks — a shared outer transaction can't produce that contention. Truncation at setup (not teardown) means a crashed test can't poison the one after it, and a failure's rows remain for post-mortem inspection. `entries_no_update` is a row-level `BEFORE UPDATE OR DELETE` trigger, so it does not intercept `TRUNCATE` — pinned by `tests/integration/test_truncate_bypasses_trigger` — which is the one fact the whole design leans on.
 **Gotcha fixed along the way:** `admin_engine` must be function-scoped, not session-scoped — pytest-asyncio gives each test its own event loop by default, and a session-scoped asyncpg engine hands out loop-bound connections to a later test's different loop, surfacing as an opaque `InterfaceError: another operation is in progress`.
+
+---
+
+# Phase 3 — Idempotency
+
+## The claim commits separately from the crux commit
+
+**Chosen:** `ledger.core.idempotency.claim_key` commits immediately on a fresh claim or a stale-lock reclaim. The ledger write and the key's `status='completed'` UPDATE (`complete_key`) then share a *second*, later commit, made by `IdempotentRequest.run`.
+**Rejected:** one transaction covering the claim through completion.
+**Why:** this reads like it contradicts SPEC.md §6's "the single commit at the end is the crux" and doesn't — that sentence is about which *two* things share a commit (the ledger write and the completion), not about the whole request being one transaction. Postgres's `INSERT ... ON CONFLICT DO NOTHING` uses speculative insertion: when it conflicts with a row from an *uncommitted* transaction, it blocks on that transaction's outcome. If the claim shared a transaction with the (potentially slow) `execute()` step, all 20 concurrent duplicates in SPEC.md §10's test would queue behind the winner's entire posting instead of observing the `in_progress` row and returning a fast 409 — the fault suite's "1 execution, 19 replays or 409s" would degenerate into 20 executions run one at a time, and the 30-second TTL would be unobservable. Committing the claim immediately is what makes conflicts cheap and stale locks reclaimable at all.
+
+## `get_idempotent_request` does no I/O; the claim happens inside `run()`
+
+**Chosen:** the FastAPI dependency only reads the (already-buffered) request body, path params, and route template to compute the fingerprint — no database access. `claim_key` is called from `IdempotentRequest.run`, invoked explicitly from inside the route body.
+**Rejected:** claiming the key directly in the dependency, which is what SPEC.md §11's "a FastAPI dependency" suggests at face value.
+**Why:** FastAPI resolves every dependency in a route's tree *before* it validates the endpoint's own Pydantic body model (`fastapi.dependencies.utils.solve_dependencies` runs the sub-dependency loop to completion, then validates `dependant.body_params`). A dependency that claimed the key would still claim it for a request whose body is syntactically valid JSON but fails `TransactionCreate` validation — and nothing would ever complete or release that claim, because the route body (and therefore `run()`) never executes for a 422. Deferring the claim into `run()` means it only happens once FastAPI has already accepted the request.
+**Consequence:** the dependency is `get_idempotent_request` (the claim/replay/reclaim machinery lives entirely in `ledger.core.idempotency` and `IdempotentRequest.run`), not a single opaque dependency as §11's phrasing implies — but `run(execute_fn)` matches §6's own `handle(request, endpoint, key, execute_fn)` signature exactly.
+
+## Endpoint scope is the route template; path params are folded into the fingerprint
+
+**Chosen:** `endpoint = f"{method} {route.path}"` (e.g. `POST /v1/transactions/{transaction_id}/reverse`), and the fingerprint hashes `{"body": ..., "path": {name: str(value), ...}}`, not the body alone.
+**Rejected:** hashing `request.body` alone, which is what SPEC.md §6 literally says.
+**Why:** `POST /v1/transactions/{id}/reverse` has no body at all — a body-only fingerprint would be identical for every reversal a client ever makes with that route, so a stale-lock reclaim could silently replay (or, worse, re-execute) against a *different* transaction than the one the key was first used for. Folding path params into the fingerprint, while keeping the concrete resource id out of `endpoint`, keeps `(key, endpoint)` scoping bounded by route count while still disambiguating targets. Pinned by `tests/faults/test_idempotency_reuse.py::test_same_key_on_reverse_for_two_different_transactions_is_key_reuse`.
+
+## Canonical JSON drops `null` object members only
+
+**Chosen:** `canonical_json`'s null-dropping pre-pass recurses into `dict`s and `list`s but only removes `None`-valued *object* members; `None` values inside arrays are preserved.
+**Rejected:** dropping `None` wherever it appears, including array elements.
+**Why:** SPEC.md §6 says "drop nulls" without qualification, but dropping array elements shifts indices — `[1, null, 2]` would canonicalize identically to `[1, 2]`, which are different requests. Object-member dropping is safe because `{"a": 1, "b": null}` and `{"a": 1}` really do mean the same request (an omitted optional field and an explicit null are equivalent in this API's schemas).
+
+## Replayed responses are stored as a versioned envelope, not the bare body
+
+**Chosen:** `response_body` (JSONB, an existing column — no migration) stores `{"v": 1, "body": ..., "headers": ...}`, serialized with `fastapi.encoders.jsonable_encoder` so it matches byte-for-byte what FastAPI's own response serialization would produce.
+**Rejected:** storing the bare response body and deriving headers like `Location` from `body["id"]` at replay time.
+**Why:** `Location` (and any other header a route sets) has to survive a replay, and SPEC.md §6 only describes storing `response_body`/`response_status`. Deriving `Location` from the body would couple the generic idempotency layer to transaction-shaped responses and break for Phase 4's `POST /v1/reconciliation/runs`, whose response has no analogous `id`-based URL. The `"v"` tag lets the envelope shape change later without misreading a row written by an older deploy.
+
+## `DuplicateTransaction` keeps sole ownership of `/errors/idempotency-conflict`
+
+**Chosen:** SPEC.md §6's "409 IdempotencyConflict" (an in-flight lock, not yet stale) is rendered as the *existing* `DuplicateTransaction` class and its existing URI. `ledger.core.idempotency` imports it under the alias `from ledger.core.errors import DuplicateTransaction as IdempotencyConflict`, so the protocol code reads in SPEC's vocabulary without declaring a second `LedgerError` subclass.
+**Rejected:** a distinct `IdempotencyConflict` class with its own URI (which would violate `tests/unit/test_error_catalog.py::test_error_types_are_unique` unless `DuplicateTransaction` moved to a different URI first — considered and rejected as unnecessary churn).
+**Why:** SPEC.md §9's error table has exactly one 409 idempotency slot, and from a client's perspective the raw unique-constraint backstop and the in-flight-lock conflict mean the identical thing: retry. `DuplicateTransaction` now also carries `headers = {"Retry-After": "1"}` (via the new `LedgerError.headers`/`problem_headers()` machinery, additive to `_ledger_error_handler`), which applies uniformly regardless of which code path raised it.
+
+## The claim is released, not left locked, when `execute_fn` raises a non-duplicate error
+
+**Chosen:** `IdempotentRequest.run` catches any exception other than `DuplicateTransaction`, rolls back, calls `release_key` (a `DELETE` fenced on the `locked_at` this claim wrote), and re-raises.
+**Rejected:** leaving the key `in_progress` until the TTL expires (SPEC.md §6 doesn't describe this case at all — its `execute_fn` is assumed to succeed or raise `DuplicateTransaction`).
+**Why:** if `execute_fn` raises e.g. `InsufficientFunds`, the ledger write never happened — there's nothing to be idempotent about. Leaving the key locked would force a client that corrects a typo and retries immediately to wait out the full 30-second TTL for no reason. `release_key`'s fence on `locked_at` matters the other way: a slow original failing at T+40s must not delete a *different* request's live reclaimed claim out from under it. `complete_key` carries no equivalent fence, because the `transactions.idempotency_key` unique constraint already guarantees at most one caller ever reaches it successfully.
+
+## Staleness is evaluated with the Postgres clock, not the app clock
+
+**Chosen:** `claim_key`'s conflict-branch `SELECT` computes `now() - locked_at > make_interval(secs => :ttl)` in SQL.
+**Rejected:** comparing `row.locked_at` against `datetime.now(UTC)` in Python, which is what SPEC.md §6's pseudocode (`now() - row.locked_at < LOCK_TTL`) reads as if written for a single-process, single-clock system.
+**Why:** `locked_at` is written by the database server's `now()`; comparing it against an application host's clock introduces skew that could reclaim a lock early (or late) under any clock drift between app and DB hosts — a correctness-relevant gap for a lock whose entire purpose is bounding how long a reclaim can jump the queue.
+
+## Phase 3 ships zero migrations
+
+**Chosen:** no `0002_*` migration. `idempotency_keys` (all columns SPEC.md §6 needs), its `idempotency_status` enum, and `transactions.idempotency_key UNIQUE` all already exist from `0001_initial_schema`.
+**Why no new index:** every Phase 3 access to `idempotency_keys` is a primary-key lookup (`WHERE key = :key`); there is no scan over `status` or `locked_at` anywhere, so an index on either would never be chosen by the planner and would only cost write amplification on the busiest small table in the system.
+**Deferred with a trigger condition:** `idempotency_keys` grows without bound — one row per idempotent request, forever, with no expiry. A retention job (`DELETE ... WHERE status = 'completed' AND created_at < now() - interval '30 days'`) plus `ix_idempotency_keys_created_at` should land together, once there's an operational surface (Phase 7, alongside `/metrics` and deploy) to run the sweep from — building the index first would be dead weight until something uses it.
+
+## Idempotency metrics are structured log events for now
+
+**Chosen:** `idempotency.claimed` / `.replayed` / `.conflict` / `.reclaimed` / `.released` / `.duplicate_backstop` are logged via the existing `structlog` setup at the points `IdempotentRequest.run` and `claim_key` already touch.
+**Rejected:** wiring up `idempotency_replays_total` / `idempotency_conflicts_total` now, as named in SPEC.md §9.
+**Why:** there is no `/metrics` endpoint or metrics registry until Phase 7 (SPEC.md §12); adding counters now means standing up that infrastructure early for two metrics that Phase 7 will want to define alongside everything else. The structured log events are the Phase 7 wiring points, named to match the metrics they'll eventually back.
