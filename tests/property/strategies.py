@@ -97,7 +97,17 @@ def balanced_legs(draw: st.DrawFn, n_accounts: int, currency: str) -> tuple[Leg,
     if k == 2:
         debit_amounts = [total]
     else:
-        splits = sorted(draw(st.integers(min_value=1, max_value=total - 1)) for _ in range(k - 2))
+        # Split points must be distinct -- a repeated split would produce a
+        # zero-length (amount=0) leg, which post_transaction rejects.
+        splits = draw(
+            st.lists(
+                st.integers(min_value=1, max_value=total - 1),
+                min_size=k - 2,
+                max_size=k - 2,
+                unique=True,
+            )
+        )
+        splits.sort()
         bounds = [0, *splits, total]
         debit_amounts = [b - a for a, b in pairwise(bounds)]
 
