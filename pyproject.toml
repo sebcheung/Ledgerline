@@ -81,6 +81,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["ledger"]
+concurrency = ["greenlet", "thread"]
 
 [tool.coverage.report]
 exclude_lines = [

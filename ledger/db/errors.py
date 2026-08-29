@@ -4,19 +4,16 @@ SQLAlchemy `IntegrityError`.
 asyncpg raises its own `UniqueViolationError`; SQLAlchemy's asyncpg dialect
 wraps that in its own DBAPI-shim exception, which SQLAlchemy then wraps
 again in `sqlalchemy.exc.IntegrityError`. The original asyncpg exception
-(which carries `constraint_name` and `sqlstate`) ends up reachable via
-`exc.orig`, and on some driver/SQLAlchemy version combinations one level
-further via `exc.orig.__cause__`. We walk both. asyncpg's exception
-attributes are dynamically set (not part of a typed public API), so this
-uses `getattr(..., default)` throughout rather than `# type: ignore` --
-mypy --strict has no way to know they exist, and a default gracefully
-degrades to the substring fallback below instead of raising.
+(which carries `constraint_name`) ends up reachable via `exc.orig`, and on
+some driver/SQLAlchemy version combinations one level further via
+`exc.orig.__cause__`. We walk both. asyncpg's exception attributes are
+dynamically set (not part of a typed public API), so this uses
+`getattr(..., default)` throughout rather than `# type: ignore` -- mypy
+--strict has no way to know they exist, and a default gracefully degrades
+to the substring fallback below instead of raising.
 """
 
 from sqlalchemy.exc import DBAPIError
-
-#: Postgres SQLSTATE for a unique_violation.
-UNIQUE_VIOLATION_SQLSTATE = "23505"
 
 
 def constraint_name_of(exc: DBAPIError) -> str | None:
@@ -42,11 +39,3 @@ def constraint_name_of(exc: DBAPIError) -> str | None:
         if len(parts) >= 2:
             return parts[1]
     return None
-
-
-def is_unique_violation(exc: DBAPIError) -> bool:
-    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
-        sqlstate = getattr(candidate, "sqlstate", None)
-        if sqlstate == UNIQUE_VIOLATION_SQLSTATE:
-            return True
-    return False
