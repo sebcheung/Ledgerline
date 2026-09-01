@@ -29,6 +29,20 @@ class Settings(BaseSettings):
     # the lock went stale mid-run. See docs/DECISIONS.md Phase 4.
     recon_run_lock_ttl_seconds: int = 300
 
+    # Used starting Phase 5 (outbox fan-out + webhook dispatcher, SPEC.md §8).
+    webhook_poll_interval_seconds: float = 1.0
+    webhook_batch_size: int = 100
+    webhook_fanout_batch_size: int = 500
+    webhook_max_attempts: int = 8
+    webhook_base_delay_seconds: float = 1.0
+    webhook_max_delay_seconds: float = 3600.0
+    # SPEC.md §8's "semaphore of 10" -- the per-cycle bound on concurrent
+    # outbound POSTs, not a connection-pool size.
+    webhook_concurrency: int = 10
+    webhook_stale_claim_seconds: int = 60
+    webhook_connect_timeout_seconds: float = 5.0
+    webhook_read_timeout_seconds: float = 5.0
+
 
 @lru_cache
 def get_settings() -> Settings:
