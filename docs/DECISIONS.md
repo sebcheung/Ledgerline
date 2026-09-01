@@ -227,3 +227,130 @@ Each entry: what was chosen, what was rejected, why.
 **Chosen:** `idempotency.claimed` / `.replayed` / `.conflict` / `.reclaimed` / `.released` / `.duplicate_backstop` are logged via the existing `structlog` setup at the points `IdempotentRequest.run` and `claim_key` already touch.
 **Rejected:** wiring up `idempotency_replays_total` / `idempotency_conflicts_total` now, as named in SPEC.md §9.
 **Why:** there is no `/metrics` endpoint or metrics registry until Phase 7 (SPEC.md §12); adding counters now means standing up that infrastructure early for two metrics that Phase 7 will want to define alongside everything else. The structured log events are the Phase 7 wiring points, named to match the metrics they'll eventually back.
+
+---
+
+# Phase 4 — Settlements + Reconciliation
+
+## `accounts.is_clearing`, not a config map of currency -> account id
+
+**Chosen:** a new `accounts.is_clearing` boolean, one per currency (`uq_accounts_clearing_per_currency`, mirroring `uq_accounts_suspense_per_currency` exactly), is the resolver's "implied asset account" for `unexpected_settlement`/`amount_mismatch` adjustments (SPEC.md §7 names this account but defines no column for it).
+**Rejected:** a `RECON_CLEARING_ACCOUNTS: dict[str, uuid.UUID]` setting.
+**Why:** a config map can point at a deleted or wrong-currency account with no DB-level guard; `is_clearing` gets the same enforcement `is_suspense` already has for free. Two more guards close the gaps a bare boolean alone would leave open: `CHECK (NOT is_clearing OR type = 'asset')` (a clearing account is an asset account by definition) and `CHECK (NOT (is_suspense AND is_clearing))` (one account playing both roles would debit and credit itself in the `unexpected_settlement` adjustment -- `post_transaction` would accept that silently as a balanced, meaningless zero-effect posting).
+**Operational requirement, not a resolver code path:** both the suspense and clearing account for a currency must be created with `allow_negative=true`, or `InsufficientFunds` strands nearly every adjustment unresolved. `scripts/seed.py` creates them that way; this is written down here because nothing in the schema enforces it.
+
+## Manual resolve is action-based: `post_adjustment` | `suppress`
+
+**Chosen:** `POST /v1/reconciliation/findings/{id}/resolve` takes `{"action": "post_adjustment" | "suppress", "note": ...}`. `post_adjustment` is valid only for `unexpected_settlement`/`amount_mismatch` (422 `InvalidFindingResolution` otherwise -- `in_flight`/`duplicate_settlement` already resolved themselves, `missing_settlement`/`currency_mismatch` have no delta to move) and reuses the exact ledger effect `resolve()` would have posted automatically, bypassing the auto-resolve threshold. `suppress` is valid for any still-`unresolved` finding and has no ledger effect.
+**Why not idempotent:** SPEC.md §6's idempotent-endpoint list does not include this route, and it posts real money on an explicit, one-shot operator action -- unlike the run endpoint, there is no legitimate reason to retry it with the same key. Guarded instead by `SELECT ... FOR UPDATE` on the finding row plus a compare-and-swap `UPDATE ... WHERE resolution = 'unresolved'` with a `rowcount` check -- the same layered-guards shape this file already uses for double-reversal (Phase 2, "Three independent guards against double reversal"). A `rowcount == 0` raises the new `FindingAlreadyResolved` (409).
+**Defense in depth:** the adjustment it posts uses the deterministic `recon-adjust:{finding_id}` idempotency key (see below), so even a bug in the CAS guard could not double-post.
+
+## Concurrent runs: `pg_try_advisory_xact_lock`, acquired inside the idempotent `execute()` closure
+
+**Chosen:** a single, literal, checked-in `bigint` lock key (`zlib.crc32(b"ledgerline:reconciliation_run")` -- never Python's `hash()`, which `PYTHONHASHSEED` randomizes per process and would let two workers take different locks for what must be one global lock), acquired via `pg_try_advisory_xact_lock` as the first thing `execute_run` does. Failure raises the new `ReconciliationRunInProgress` (409, `Retry-After: 5`; a genuinely new URI slot -- `DuplicateTransaction` owns `/errors/idempotency-conflict` exclusively, see the Phase 3 entry below).
+**Rejected:** a partial unique index on `reconciliation_runs (true) WHERE status = 'running'`.
+**Why:** the lock must be taken *inside* `IdempotentRequest.run`'s `execute()` closure, not before it -- `claim_key` commits (Phase 3's "the claim commits separately from the crux commit"), and an `xact`-scoped advisory lock acquired before that commit would be released by it, defeating the whole point. Taken inside `execute()`, the lock is released by `run`'s own commit or rollback with nothing to sweep after a crash -- a `status='running'` unique index would instead leave a permanently stuck row behind a crashed run, needing a separate sweeper this phase has no reason to build.
+**Consequence to log:** the loser's 409 propagates through `run`'s generic `except Exception`, which rolls back and deletes the loser's *own* claim (`release_key`) -- a losing caller's retry re-executes rather than replaying, which is correct (its request never had any effect), but it is the same mechanism the TTL entry below has to coexist with.
+
+## The re-run-idempotency index must be unconditional, not scoped to `resolution = 'unresolved'`
+
+**Chosen:**
+```sql
+CREATE UNIQUE INDEX uq_recon_findings_open
+  ON reconciliation_findings (finding_type, transaction_id, settlement_line_id)
+  NULLS NOT DISTINCT;
+```
+with **no** `WHERE` clause, and findings inserted via `ON CONFLICT (finding_type, transaction_id, settlement_line_id) DO NOTHING RETURNING ...`. The resolver (`ledger.reconciliation.resolver.resolve`) is called with, and only ever processes, that `RETURNING` set -- never the matcher's full in-memory classification.
+**Rejected (first draft, caught by design review):** the same index scoped `WHERE resolution = 'unresolved'`.
+**Why the scoped version is actively wrong, not just unnecessary:** it excludes exactly the rows that most need suppressing on re-run. A `suppressed` `in_flight` finding, or an `auto_resolved` `unexpected_settlement`, falls outside a `resolution='unresolved'` predicate and would be **re-inserted** by the next run -- and in the `unexpected_settlement` case, re-adjusted, a genuine double-post of real money that `verify_global_balance` cannot catch, because the ledger stays internally balanced, just wrong by 2×. The unconditional index has no such gap: a recurring `missing_settlement`/`in_flight` is silently skipped regardless of its resolution, an operator's manual `suppress` is never undone by a later run (nothing ever removes the row from the index), and an auto-resolved finding can never be adjusted twice.
+**Why driving the resolver off `RETURNING`, and not the matcher's classification, is the other half of the same fix:** without it, a conflicting (already-open) finding that the `INSERT` correctly skipped would still reach the resolver from the matcher's in-memory list and get adjusted anyway -- the index alone is not sufficient; the resolver's input has to be the rows that actually got created.
+**Not caught by `alembic check`:** reading `alembic/ddl/postgresql.py` confirms `compare_indexes` checks `nulls_not_distinct` but never compares a `postgresql_where` predicate at all -- a scoped predicate could drift silently between the migration and the model. One more reason to prefer the unconditional form: there is no predicate to drift.
+**Belt-and-suspenders, not instead of the index:** every match (pass 1, pass 2 regardless of delta, pass 3) sets `settlement_lines.matched_transaction_id`, which removes the line from future *candidate sets* entirely (SPEC.md §7 "set on every match"). An auto-resolved `unexpected_settlement`'s line gets its `matched_transaction_id` re-pointed at the *adjusting* transaction once resolved -- the same trick already used for `duplicate_settlement`'s redundant line(s).
+**`findings_by_type` reports two counts, not one:** `observed` (the matcher's full classification) and `created` (the `RETURNING` count). Without the split, a re-run's response would read as a clean ledger while genuinely open drift is still sitting there unresolved.
+
+## Reversals are excluded from the transaction candidate set
+
+**Chosen:** the matcher's transaction candidate set adds `reversal_of IS NULL` to SPEC.md §7's literal `status='posted', source='api'`.
+**Why:** a reversal deliberately carries `external_ref = NULL` (Phase 2's decision, made for exactly this reason) and has no settlement of its own -- pass 1 can never match it, and without this exclusion it becomes a spurious `missing_settlement` (or, worse, an accidental pass-3 fuzzy match against an unrelated settled line, since a ref-less reversal is otherwise a perfectly plausible fuzzy candidate). This is the non-obvious half of that Phase 2 decision finally being used.
+
+## Candidate-set ordering is a deterministic total order, not "however Postgres returns rows"
+
+**Chosen:** the transaction candidate set is ordered `(created_at, id)`; the settlement-line candidate set is ordered `(value_date, id)`. Pass 1's "match first, remainder duplicate" and pass 3's greedy nearest-date pairing are both defined only in terms of this order.
+**Why:** `created_at`/`value_date` are not unique -- the same non-uniqueness the pagination cursor's `id` tiebreak already documents (`now()` is transaction-start time, so a multi-leg transaction's rows share one `created_at`). Without an explicit tiebreak, which line "wins" pass 1's duplicate-settlement selection, and which candidate wins pass 3's greedy pairing, would depend on incidental physical row order -- making the fault suite's "duplicated lines -> `duplicate_settlement`" row non-deterministic across runs.
+
+## Settlement-line candidates are widened by `RECON_FUZZY_DAYS` on both sides; residue is not
+
+**Chosen:** the line candidate set spans `[window_start - fuzzy_days, window_end + fuzzy_days]` (UTC calendar dates), but a line pulled in *only* by that margin is never itself reported as `unexpected_settlement` -- residue is re-checked against the true `[window_start, window_end]` window.
+**Why:** pass 3 needs to reach a line whose `value_date` lands just outside the true window (a transaction posted the day before `window_start` whose settlement lands the day before that). Without widening the candidate set, that transaction is unmatchable and permanently misclassifies as `missing_settlement` on every run. Without the true-window recheck on the *unexpected_settlement* side, every widened line pulled in but left unmatched would be reported as drift it was never actually inside the window for.
+**New setting:** `RECON_FUZZY_DAYS` (default 2, matching SPEC.md §7's hardcoded "±2 days") -- pulled into `ledger/config.py` so the widening and pass 3's `abs(...) <= fuzzy_days` check can't drift apart from each other.
+
+## Pass 2 always matches, regardless of delta size or currency
+
+**Chosen:** once a settlement line is selected by pass 2 (ref-only), `matched_transaction_id` is set unconditionally -- the `currency_mismatch`/`amount_mismatch` finding is emitted *in addition to*, not instead of, the match.
+**Why:** SPEC.md §7 says "set on every match"; if a large `amount_mismatch` or any `currency_mismatch` didn't count as a match, it would re-enter the candidate set and be re-reported on every future run even though it's already a known, tracked finding (the unconditional index handles the finding-row side of this, but the line would otherwise keep being offered to pass 1/pass 3 too, needlessly). `currency_mismatch` computes no `delta_amount` (left `NULL`) -- a bigint difference between two currencies is meaningless, so the currency check happens strictly before any delta arithmetic.
+
+## `amount_mismatch`'s asset leg: single non-clearing leg, or fall back to the clearing account
+
+**Chosen:** the resolver looks for exactly one non-clearing, asset-type entry on the mismatched transaction. If there isn't exactly one (a transfer between two asset accounts has two; a transaction with no asset leg at all has zero), it falls back to `clearing(currency)` as the counter-leg instead of leaving the finding unresolved.
+**Why:** without the fallback, the single most common real-world case a payments ledger has -- an asset-to-asset transfer -- would never auto-resolve, silently defeating the point of having a threshold at all. `is_clearing` already exists for exactly this purpose (see above); reusing it here means `amount_mismatch` and `unexpected_settlement` share one account-selection rule instead of two.
+**Sign convention, both adjustment types:** the resolver never assumes a positive amount. `unexpected_settlement`: `line.amount > 0` -> debit clearing / credit suspense; `< 0` -> the reverse. `amount_mismatch`: `delta = line.amount - txn.amount > 0` -> debit asset leg / credit suspense; `< 0` -> the reverse. `settlement_lines.amount` (unlike `entries.amount`) carries no `CHECK (amount > 0)` in SPEC.md §3 -- a real feed contains refunds.
+
+## Every resolver adjustment gets its own `session.begin_nested()`, distinct from `posting.py`'s existing SAVEPOINT
+
+**Chosen:** `ledger.reconciliation.resolver._adjust` wraps the *entire* `post_transaction()` call in its own nested savepoint and catches `LedgerError`, leaving the finding `unresolved` with a logged reason on failure, then continuing the loop.
+**Rejected (first draft, caught by design review):** relying on `posting.py`'s existing `SAVEPOINT` (Phase 2, "`SAVEPOINT` around the transaction insert") to absorb a failed adjustment.
+**Why the existing savepoint doesn't cover this:** it wraps only the `INSERT INTO transactions` statement, specifically to survive the idempotency-key/`reversal_of` unique-violation backstop. `InsufficientFunds`, `CurrencyMismatch`, `AccountNotFound`, and `InvalidTransactionShape` are all raised at steps 1-5 of `post_transaction`, *before* that savepoint ever opens -- no SQL has failed yet, so there's nothing for it to roll back to. Worse, an `IntegrityError` from the entries insert or the outbox `emit_event` (both *after* the savepoint closes) would poison the whole outer transaction (`25P02`) with no savepoint left to recover from, failing every later finding in the same run's loop. This is the general form of the "one expected failure must not poison the session" pattern applied one level higher, because the resolver -- unlike a single API request -- posts several transactions in a sequence.
+**Deterministic idempotency key, defense in depth:** every adjustment posts with `idempotency_key = f"recon-adjust:{finding_id}"` rather than none. The unconditional findings index and the RETURNING-driven resolver are what actually prevent a double-post; this key means that even a future bug that somehow drove the resolver off the wrong row set would still hit the `transactions.idempotency_key` unique constraint before a second adjustment for the same finding could land.
+
+## The reconciliation-run window is read from the DB clock, not Python's
+
+**Chosen:** `execute_run` does `now_ts = (SELECT now())` once, on the run's own connection, and derives `window_end`/`window_start`/`cutoff_at` from it -- and passes `now_ts` explicitly into the `reconciliation_runs` insert, overriding the `started_at` column's `server_default=now()`.
+**Why:** this is the Phase 3 "staleness is evaluated with the Postgres clock, not the app clock" decision applied again, for the same reason: `transactions.created_at` and `settlement_lines.ingested_at` are both written by the DB server, so a window computed from the app host's clock could disagree with them under any clock skew -- and would disagree with the run row's own `started_at` if that were left to its server default instead of being pinned to the same `now_ts`.
+
+## The reconciliation run's idempotency TTL is its own, larger setting
+
+**Chosen:** `POST /v1/reconciliation/runs` uses a dedicated `get_reconciliation_idempotent_request` dependency backed by `RECON_RUN_LOCK_TTL_SECONDS` (default 300s), not the shared `IDEMPOTENCY_LOCK_TTL_SECONDS` (30s) every other idempotent route uses.
+**Why:** a run over a window with real volume in it can legitimately take longer than 30 seconds. If it did, a concurrent retry with the same key would see the lock as stale, reclaim it (rewriting `locked_at`), fail to acquire the advisory lock, and its `except Exception` handler would call `release_key` -- fenced on `locked_at`, so it deletes the row, because the *reclaimer* now owns the newest `locked_at`. The original run, still executing, would then call `complete_key` (`WHERE status = 'in_progress'`), find no matching row, raise `IdempotencyStateError`, and roll its own otherwise-successful run back for no ledger-level reason at all.
+**Accepted limitation:** this is a bound, not a full fix -- a run that blows through even the higher TTL still needs an async execution model. `worker/recon_scheduler.py` stays a stub for Phase 4, calling the same `ledger.reconciliation.runner.execute_run` when it lands, rather than inventing a second code path; running synchronously inside the request is an explicit, accepted Phase 4 choice, not an oversight.
+
+## A failed run's audit row is written outside the run's single commit, on a separate connection
+
+**Chosen:** `verify_global_balance` is called from inside `execute_run`, before the transaction commits (SPEC.md §7: "fail the run loudly if it does not hold"). If it fails, `ReconciliationRunFailed` is raised, which propagates out through `IdempotentRequest.run` and rolls the *entire* transaction back -- correct, because adjustments that would leave invariant 7 broken must never commit. Before re-raising, `execute_run` writes a `status='failed'` `reconciliation_runs` row on a **separate connection** (`ledger/db/engine.py`'s module-level engine, not the request session), carrying the window bounds and the failing per-currency report.
+**Why a second write is necessary at all:** without it, the failed run leaves no trace whatsoever -- the very row that would explain what happened rolls back along with everything it's trying to explain. This is the one place in Phase 4 that writes outside the run's single commit.
+**Consequence:** `status='running'` is never durably observable by another session (the row exists only inside this transaction until it commits as `'completed'`) -- this is intentional, not a gap. A concurrent run attempt is blocked by the advisory lock, not by any other session reading this column.
+
+## No new outbox event type for reconciliation
+
+**Chosen:** adjusting transactions go through the same `post_transaction()` every other posting does, so they already emit `transaction.posted` into `outbox_events` inside the run's single commit, for free.
+**Why:** SPEC.md §8 names no reconciliation-specific event, so none is invented. This also keeps the fault suite's `ledger_row_counts()` outbox assertions meaningful without a Phase 4 special case.
+
+## Reconciliation metrics are structured log events, same as Phase 3's idempotency events
+
+**Chosen:** `reconciliation.run_started` / `.finding` / `.auto_resolved` / `.unresolved` / `.run_completed` / `.run_failed`, carrying `finding_type` where relevant, logged via the existing `structlog` setup rather than wiring up `reconciliation_findings_total{type}` (SPEC.md §9) now.
+**Why:** identical reasoning to the Phase 3 entry above -- there is still no `/metrics` endpoint until Phase 7, and these events are named to match the counter they'll eventually back.
+
+## Ingest dedup key adds currency to SPEC.md §7's literal tuple
+
+**Chosen:** `ingest_batch` dedups within a batch on `(external_ref, amount, currency, value_date)`, not the literal `(external_ref, amount, value_date)` SPEC.md §7 writes. A `NULL external_ref` line is never deduped against another (`NULL <> NULL`), including against itself.
+**Why:** two same-day, same-amount, same-ref lines are legitimately distinct settlements if they're denominated in different currencies -- ref reuse across currencies happens with real payment processors, and the literal tuple would silently drop one.
+
+## `reconciliation_findings.created_at`, added for pagination
+
+**Chosen:** a `created_at timestamptz NOT NULL server_default now()` column, not in SPEC.md §3's column list for this table, plus `ix_reconciliation_findings_run_id (run_id, created_at, id)`.
+**Why:** `GET /v1/reconciliation/runs/{id}/findings` needs to paginate, and every other paginated listing in this project uses the opaque, versioned `(created_at, id)` keyset cursor (`ledger/schemas/pagination.py`) -- findings had no other column that could serve as a stable ordering key.
+
+## Phase 4 breaks the zero-migration streak
+
+**Chosen:** `migrations/versions/0002_reconciliation_indexes.py` -- the first migration since `0001_initial_schema`, after Phase 2 and Phase 3 both shipped zero.
+**Why:** unlike Phases 2 and 3, this one isn't optional. `0001` created exactly four indexes (`ix_accounts_currency`, `ix_transactions_created_at`, `ix_transactions_external_ref`, `ix_entries_account_id_created_at`) -- **none** on `settlement_lines` or `reconciliation_findings`, both of which the matcher and the findings API now scan continuously. `accounts.is_clearing` is also a genuinely new column. `alembic upgrade head` -> `downgrade base` -> `upgrade head` -> `alembic check` all pass, confirming the model `__table_args__` and the migration agree exactly.
+**Noted in passing, out of scope for Phase 4:** the same audit that found the above also shows `webhook_deliveries` is missing its SPEC.md §3 `(status, next_attempt_at)` index -- Phase 5 will need its own migration for the same reason.
+
+## `runner.py`, not named in SPEC.md §11's tree
+
+**Chosen:** `ledger/reconciliation/runner.py::execute_run` orchestrates the advisory lock, the run row, `matcher.match` -> the findings insert -> `resolver.resolve` -> `verify_global_balance`, and the `findings_by_type` counts. `ledger/api/routes/reconciliation.py`'s `POST /runs` handler is a thin wrapper calling it through `IdempotentRequest.run`.
+**Why:** SPEC.md §11 doesn't name this file, but keeping orchestration out of the route means the future `worker/recon_scheduler.py` (SPEC.md §12 Phase 4 build-order item, still a stub) has one call to make instead of duplicating the route's logic.
+
+## Known, accepted gap: a settlement matched before its transaction is reversed
+
+**Chosen:** left unhandled. A transaction reversed *after* its settlement line already matched leaves a settled line against a now-net-zero ledger effect, and no SPEC.md §7 finding type detects it.
+**Why not fixed:** SPEC.md §7 defines exactly six finding types over a matcher/settlement-line model that has no notion of "this settlement's transaction was later reversed." Detecting it would mean either a new finding type not in the spec, or re-scanning every historically-matched line on every run (unbounded cost, growing forever) -- both are decisions bigger than "finish Phase 4 as specified." Recorded here so it isn't silently assumed to be handled.
