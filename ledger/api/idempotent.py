@@ -185,10 +185,8 @@ class IdempotentRequest:
         )
 
 
-async def get_idempotent_request(
-    request: Request,
-    session: SessionDep,
-    key: Annotated[str | None, Depends(get_idempotency_key)],
+async def _build_idempotent_request(
+    request: Request, session: AsyncSession, key: str | None, *, lock_ttl_seconds: int
 ) -> IdempotentRequest:
     endpoint = _endpoint_of(request)
     fingerprint = None
@@ -201,8 +199,38 @@ async def get_idempotent_request(
         key=key,
         endpoint=endpoint,
         fingerprint=fingerprint,
-        lock_ttl_seconds=get_settings().idempotency_lock_ttl_seconds,
+        lock_ttl_seconds=lock_ttl_seconds,
+    )
+
+
+async def get_idempotent_request(
+    request: Request,
+    session: SessionDep,
+    key: Annotated[str | None, Depends(get_idempotency_key)],
+) -> IdempotentRequest:
+    return await _build_idempotent_request(
+        request, session, key, lock_ttl_seconds=get_settings().idempotency_lock_ttl_seconds
+    )
+
+
+async def get_reconciliation_idempotent_request(
+    request: Request,
+    session: SessionDep,
+    key: Annotated[str | None, Depends(get_idempotency_key)],
+) -> IdempotentRequest:
+    """Same protocol, a longer TTL. `POST /v1/reconciliation/runs` can
+    legitimately run past the default 30s TTL once a window has real
+    volume in it; a concurrent retry that thinks the lock went stale
+    mid-run would otherwise roll back an otherwise-successful run (see
+    docs/DECISIONS.md Phase 4). This is a bound, not a full fix -- a run
+    that also blows through this higher TTL still needs Phase 5's async
+    worker pattern."""
+    return await _build_idempotent_request(
+        request, session, key, lock_ttl_seconds=get_settings().recon_run_lock_ttl_seconds
     )
 
 
 IdempotencyDep = Annotated[IdempotentRequest, Depends(get_idempotent_request)]
+ReconciliationIdempotencyDep = Annotated[
+    IdempotentRequest, Depends(get_reconciliation_idempotent_request)
+]
