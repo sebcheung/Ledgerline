@@ -209,3 +209,69 @@ class InvalidCursor(LedgerError):
     error_type = "/errors/invalid-cursor"
     title = "Invalid pagination cursor"
     status = 400
+
+
+class ReconciliationRunInProgress(LedgerError):
+    """Phase 4: `pg_try_advisory_xact_lock` failed to acquire the single
+    reconciliation-run lock. A genuinely new 409 slot -- deliberately not a
+    reuse of `/errors/idempotency-conflict`, which `DuplicateTransaction`
+    owns exclusively (see docs/DECISIONS.md Phase 3)."""
+
+    error_type = "/errors/reconciliation-run-in-progress"
+    title = "A reconciliation run is already in progress"
+    status = 409
+    headers: ClassVar[Mapping[str, str]] = {"Retry-After": "5"}
+
+
+class ReconciliationRunNotFound(LedgerError):
+    error_type = "/errors/reconciliation-run-not-found"
+    title = "Reconciliation run not found"
+    status = 404
+
+
+class ReconciliationFindingNotFound(LedgerError):
+    error_type = "/errors/reconciliation-finding-not-found"
+    title = "Reconciliation finding not found"
+    status = 404
+
+
+class FindingAlreadyResolved(LedgerError):
+    """The compare-and-swap `UPDATE ... WHERE resolution = 'unresolved'`
+    found no matching row -- the same layered-guards pattern
+    `docs/DECISIONS.md` uses for double-reversal, applied to
+    `POST /v1/reconciliation/findings/{id}/resolve`, which (unlike the run
+    endpoint) is not itself idempotent."""
+
+    error_type = "/errors/finding-already-resolved"
+    title = "Finding already resolved"
+    status = 409
+
+
+class InvalidFindingResolution(LedgerError):
+    """`post_adjustment` requested against a finding type with nothing to
+    adjust (`in_flight`, `duplicate_settlement` -- already self-resolving;
+    `missing_settlement`, `currency_mismatch` -- no meaningful delta)."""
+
+    error_type = "/errors/invalid-finding-resolution"
+    title = "Invalid finding resolution"
+    status = 422
+
+
+class ClearingAccountExists(LedgerError):
+    """The partial unique index `uq_accounts_clearing_per_currency` fired --
+    a clearing account for this currency already exists."""
+
+    error_type = "/errors/clearing-account-exists"
+    title = "Clearing account already exists"
+    status = 409
+
+
+class ReconciliationRunFailed(LedgerError):
+    """SPEC.md §7: "call verify_global_balance() and fail the run loudly if
+    it does not hold." A server-side invariant violation, not a client
+    error -- raising this rolls the entire run back (see
+    ledger.reconciliation.runner)."""
+
+    error_type = "/errors/reconciliation-run-failed"
+    title = "Reconciliation run failed post-run verification"
+    status = 500

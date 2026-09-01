@@ -6,7 +6,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger.api.deps import SessionDep
-from ledger.core.errors import AccountNotFound, InvalidCursor, SuspenseAccountExists
+from ledger.core.errors import (
+    AccountNotFound,
+    ClearingAccountExists,
+    InvalidCursor,
+    SuspenseAccountExists,
+)
 from ledger.db.errors import constraint_name_of
 from ledger.models.accounts import Account
 from ledger.models.balances import AccountBalance
@@ -17,12 +22,21 @@ from ledger.schemas.pagination import Page, decode_cursor, encode_cursor
 router = APIRouter()
 
 _CONSTRAINT_SUSPENSE_PER_CURRENCY = "uq_accounts_suspense_per_currency"
+_CONSTRAINT_CLEARING_PER_CURRENCY = "uq_accounts_clearing_per_currency"
 
 
 async def _find_suspense_account(session: AsyncSession, currency: str) -> uuid.UUID | None:
     return (
         await session.execute(
             select(Account.id).where(Account.currency == currency, Account.is_suspense.is_(True))
+        )
+    ).scalar_one_or_none()
+
+
+async def _find_clearing_account(session: AsyncSession, currency: str) -> uuid.UUID | None:
+    return (
+        await session.execute(
+            select(Account.id).where(Account.currency == currency, Account.is_clearing.is_(True))
         )
     ).scalar_one_or_none()
 
@@ -42,6 +56,7 @@ async def create_account(
                         currency=payload.currency,
                         allow_negative=payload.allow_negative,
                         is_suspense=payload.is_suspense,
+                        is_clearing=payload.is_clearing,
                     )
                     .returning(
                         Account.id,
@@ -50,6 +65,7 @@ async def create_account(
                         Account.currency,
                         Account.allow_negative,
                         Account.is_suspense,
+                        Account.is_clearing,
                         Account.created_at,
                     )
                 )
@@ -63,10 +79,18 @@ async def create_account(
                 )
             )
     except IntegrityError as exc:
-        if constraint_name_of(exc) == _CONSTRAINT_SUSPENSE_PER_CURRENCY:
+        constraint = constraint_name_of(exc)
+        if constraint == _CONSTRAINT_SUSPENSE_PER_CURRENCY:
             existing = await _find_suspense_account(session, payload.currency)
             raise SuspenseAccountExists(
                 f"a suspense account for {payload.currency} already exists",
+                currency=payload.currency,
+                existing_account_id=existing,
+            ) from exc
+        if constraint == _CONSTRAINT_CLEARING_PER_CURRENCY:
+            existing = await _find_clearing_account(session, payload.currency)
+            raise ClearingAccountExists(
+                f"a clearing account for {payload.currency} already exists",
                 currency=payload.currency,
                 existing_account_id=existing,
             ) from exc
@@ -81,6 +105,7 @@ async def create_account(
         currency=row.currency,
         allow_negative=row.allow_negative,
         is_suspense=row.is_suspense,
+        is_clearing=row.is_clearing,
         created_at=row.created_at,
         balance=0,
         entry_count=0,
@@ -98,6 +123,7 @@ async def get_account(account_id: uuid.UUID, session: SessionDep) -> AccountRead
                 Account.currency,
                 Account.allow_negative,
                 Account.is_suspense,
+                Account.is_clearing,
                 Account.created_at,
                 AccountBalance.balance,
                 AccountBalance.entry_count,
@@ -115,6 +141,7 @@ async def get_account(account_id: uuid.UUID, session: SessionDep) -> AccountRead
         currency=row.currency,
         allow_negative=row.allow_negative,
         is_suspense=row.is_suspense,
+        is_clearing=row.is_clearing,
         created_at=row.created_at,
         balance=row.balance,
         entry_count=row.entry_count,

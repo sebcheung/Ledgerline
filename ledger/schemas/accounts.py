@@ -21,6 +21,10 @@ class AccountCreate(BaseModel):
     # schema default is the only source of the default value.
     allow_negative: bool = False
     is_suspense: bool = False
+    #: Phase 4: one per currency, mirroring is_suspense -- the resolver's
+    #: implied asset account for unexpected_settlement/amount_mismatch
+    #: adjustments (SPEC.md §7).
+    is_clearing: bool = False
 
 
 class AccountRead(BaseModel):
@@ -32,6 +36,7 @@ class AccountRead(BaseModel):
     currency: CurrencyCode
     allow_negative: bool
     is_suspense: bool
+    is_clearing: bool
     created_at: datetime
     balance: SignedMinorUnits
     entry_count: int
