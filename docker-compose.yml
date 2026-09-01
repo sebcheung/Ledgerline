@@ -27,5 +27,15 @@ services:
       - "8000:8000"
     command: sh -c "alembic upgrade head && uvicorn ledger.api.main:app --host 0.0.0.0 --port 8000"
 
+  webhook-worker:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ledgerline:ledgerline@db:5432/ledgerline
+      LOG_LEVEL: INFO
+    command: python -m worker.webhook_worker
+
 volumes:
   pgdata:
