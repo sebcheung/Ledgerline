@@ -343,7 +343,7 @@ with **no** `WHERE` clause, and findings inserted via `ON CONFLICT (finding_type
 
 **Chosen:** `migrations/versions/0002_reconciliation_indexes.py` -- the first migration since `0001_initial_schema`, after Phase 2 and Phase 3 both shipped zero.
 **Why:** unlike Phases 2 and 3, this one isn't optional. `0001` created exactly four indexes (`ix_accounts_currency`, `ix_transactions_created_at`, `ix_transactions_external_ref`, `ix_entries_account_id_created_at`) -- **none** on `settlement_lines` or `reconciliation_findings`, both of which the matcher and the findings API now scan continuously. `accounts.is_clearing` is also a genuinely new column. `alembic upgrade head` -> `downgrade base` -> `upgrade head` -> `alembic check` all pass, confirming the model `__table_args__` and the migration agree exactly.
-**Noted in passing, out of scope for Phase 4:** the same audit that found the above also shows `webhook_deliveries` is missing its SPEC.md §3 `(status, next_attempt_at)` index -- Phase 5 will need its own migration for the same reason.
+**Correction (made during Phase 5):** the line above was wrong. `0001_initial_schema.py` already creates `ix_webhook_deliveries_status_next_attempt` on `(status, next_attempt_at)`, matching `WebhookDelivery.__table_args__` exactly -- which is why `alembic check` was green through Phase 4 despite this note. The audit that produced this section was scoped to `settlement_lines`/`reconciliation_findings` and over-generalized to `webhook_deliveries` without checking it. See the Phase 5 section below for what `0003` actually needed.
 
 ## `runner.py`, not named in SPEC.md §11's tree
 
@@ -354,3 +354,64 @@ with **no** `WHERE` clause, and findings inserted via `ON CONFLICT (finding_type
 
 **Chosen:** left unhandled. A transaction reversed *after* its settlement line already matched leaves a settled line against a now-net-zero ledger effect, and no SPEC.md §7 finding type detects it.
 **Why not fixed:** SPEC.md §7 defines exactly six finding types over a matcher/settlement-line model that has no notion of "this settlement's transaction was later reversed." Detecting it would mean either a new finding type not in the spec, or re-scanning every historically-matched line on every run (unbounded cost, growing forever) -- both are decisions bigger than "finish Phase 4 as specified." Recorded here so it isn't silently assumed to be handled.
+
+# Phase 5 — Outbox + Webhooks
+
+## Fan-out tracked by `outbox_events.fanned_out_at`, not a `NOT EXISTS` anti-join
+
+**Chosen:** a nullable `fanned_out_at timestamptz` column plus a partial index `ix_outbox_events_unfanned ON outbox_events (created_at) WHERE fanned_out_at IS NULL`. The dispatcher's fan-out step claims rows from that index with `FOR UPDATE SKIP LOCKED`, inserts one `webhook_deliveries` row per active endpoint via `INSERT ... ON CONFLICT (event_id, endpoint_id) DO NOTHING`, then sets `fanned_out_at = now()` on the claimed events.
+**Rejected:** a `NOT EXISTS` anti-join against `webhook_deliveries` with no schema change. It looks free, but the un-fanned set never shrinks when zero endpoints are registered -- which is the state of every integration test, `scripts/seed.py`, and any deployment before the first endpoint is created. Every poll would then re-scan the entire, ever-growing `outbox_events` table to insert zero rows, forever, with no bound.
+**Rejected:** a `created_at` high-water mark instead of a column. Postgres `now()` is transaction-start time, so a long-running transaction that started before the watermark but committed after it would become permanently invisible to the dispatcher -- a silently dropped event, the exact failure the outbox pattern exists to prevent.
+**Consequence:** an endpoint registered *after* an event was fanned out never receives that event. Fan-out is a one-time snapshot of the active endpoint set at drain time, not a live subscription replayed against history. This is the intended semantic (a new subscriber shouldn't receive a backlog it never asked for), but it means "register an endpoint, then post a transaction" is the only order that reliably delivers.
+**Also:** `alembic`'s `compare_indexes` does not compare `postgresql_where` (see the Phase 4 entry on `docs/DECISIONS.md`'s own index-drift caveats), so the partial predicate on `ix_outbox_events_unfanned` could drift from the model silently. `tests/integration/test_migrations.py::test_unfanned_outbox_index_predicate_matches_the_model` pins the actual `pg_indexes.indexdef` directly rather than trusting `alembic check` alone.
+
+## Endpoint secrets are stored in plaintext, unlike `api_keys.key_hash`
+
+**Chosen:** `webhook_endpoints.secret` is stored as the server-generated (`secrets.token_urlsafe(32)`) plaintext value, returned exactly once in the `POST /v1/webhooks/endpoints` response body and never again -- `WebhookEndpointRead` has no `secret` field at all, so no future change to that model can leak it by accident.
+**Why this looks like a contradiction but isn't:** an API key (Phase 1's `api_keys.key_hash`) only ever needs to be *compared* against a presented value, so a one-way hash is strictly better -- it protects the credential even if the table leaks. An HMAC webhook secret must be *replayed* on every delivery to compute the signature; a one-way hash would make signing impossible. Hashing it was never on the table.
+**Mitigation:** the secret authenticates our outbound request to one endpoint we control the registration of -- it grants no access back into the ledger. It never appears in a response after creation, in a log line (the dispatcher logs delivery outcomes, never the signature or the secret), or in an error body.
+
+## The signed payload is built from bytes, not an f-string over bytes
+
+**Chosen:** `ledger/webhooks/signing.py::signing_payload` builds `f"{timestamp}.".encode("ascii") + raw_body`.
+**Rejected:** the literal reading of SPEC.md §8's `f"{timestamp}.{raw_body}"`, evaluated as an actual Python f-string with `raw_body: bytes`. An f-string interpolates `bytes` via its `repr()` (`b'{"id": ...}'`, backslash escapes and all) -- the resulting signature is internally consistent (the dispatcher would both sign and never need to un-sign this string) but matches no receiver implemented against the documented HMAC scheme, because no one else would reasonably interpolate a repr.
+**Also:** the dispatcher serializes the envelope exactly once (`serialize_envelope`, sorted keys, compact separators) and sends those same bytes as the request body (`content=body`, explicit `Content-Type` header) -- never `httpx`'s `json=` kwarg, which re-serializes independently and would silently produce a body that doesn't match the signature computed over the first serialization.
+
+## The claim is one `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING id`
+
+**Chosen:** a single statement, executed inside one `engine.begin()` transaction.
+**Rejected:** SPEC.md §8's literal two-statement pseudocode (`SELECT ... FOR UPDATE SKIP LOCKED`, then a separate `UPDATE ... WHERE id IN (...)`).
+**Why:** the two-statement form leaves a window between the SELECT and the UPDATE in which nothing prevents the same rows from being selected by a concurrent dispatcher (SKIP LOCKED only protects against a second `SELECT ... FOR UPDATE`, not against a second dispatcher's own `SELECT` racing ahead of the first's `UPDATE`). Folding both into one statement closes that window at no extra cost and is still served by `ix_webhook_deliveries_status_next_attempt`.
+
+## The stale-claim sweep does not increment `attempt_count`
+
+**Chosen:** `sweep_stale_claims` moves a `delivering` row whose `claimed_at` is older than `webhook_stale_claim_seconds` back to `pending` with `claimed_at = NULL`, leaving `attempt_count` untouched.
+**Why:** a worker killed mid-delivery made no observation of the receiver -- it doesn't know whether the request was ever sent, let alone how the receiver responded. Charging that crash against the delivery's retry budget would shrink the number of *real* receiver-facing attempts for a fault that was entirely on our side. This is also what makes delivery **at-least-once** rather than at-most-once: a redelivered event carries the same `X-Ledgerline-Event-Id`, and a receiver that dedupes on it (documented in `README.md`) sees no observable difference from a single delivery.
+
+## Manual retry (`POST /v1/webhooks/deliveries/{id}/retry`) is `dead`-only and resets the attempt budget
+
+**Chosen:** the route rejects anything but `status = 'dead'` with 409 `/errors/delivery-not-retryable`, then a compare-and-swap `UPDATE ... WHERE id = :id AND status = 'dead'` sets `status = 'pending'`, `next_attempt_at = now()`, `attempt_count = 0`, `claimed_at = NULL` -- the same layered-guard shape (`SELECT ... FOR UPDATE` + CAS `UPDATE`) as `resolve_finding` (Phase 4).
+**Why `dead`-only:** a `succeeded` row has nothing to replay; a `pending`/`delivering` row is already queued, and re-queueing it would race the dispatcher's own claim rather than add anything.
+**Why reset, not preserve, `attempt_count`:** "manual DLQ replay" means the operator has (presumably) fixed whatever was wrong at the receiver -- leaving `attempt_count` at 8 would let the replay die on its very first failure with no budget left. `last_error`/`last_response_code` are left in place for forensics; only the retry state resets.
+**Not idempotent:** unlike SPEC.md §6's idempotent-endpoint list, a second concurrent retry call on the same row gets 409 (the CAS `rowcount != 1` case), not a replayed 200 -- there is no request body to fingerprint and no reason a duplicate manual action should silently succeed twice.
+
+## The mock webhook receiver runs a real `uvicorn` server, not `httpx.ASGITransport`
+
+**Chosen:** `tests/mock_receiver`'s `mock_receiver` fixture starts `uvicorn.Server` on an ephemeral port (`port=0`) in a background `asyncio.Task`, and the fault suite's `Dispatcher` makes genuine outbound HTTP calls to it.
+**Rejected:** the `httpx.ASGITransport` pattern every other integration test uses (`app_client`, `fault_client`). It has no underlying socket, so it cannot produce a `ReadTimeout`, a `ConnectError`, or a connection reset -- three of SPEC.md §10's four webhook fault rows. Splitting the fault suite so 400/429/500 go through `ASGITransport` while timeout/reset go through a real socket would mean the two groups exercise different code paths in `Dispatcher._deliver_one`, so the thing actually under test (the exception → delivery-status mapping) would never be validated end-to-end in one place.
+**Side effect:** `uvicorn`'s websocket protocol import trips `websockets`' own legacy-module `DeprecationWarning` even though this app never uses websockets, which under this project's `filterwarnings = ["error", ...]` turns into a raised exception at server startup and silently prevents `server.started` from ever becoming `True`. Two scoped ignores (`ignore::DeprecationWarning:uvicorn.*` / `ignore::DeprecationWarning:websockets.*`) were added to `pyproject.toml` in the same commit as the fixture.
+
+## `_deliver_one`'s transport-exception messages fall back to the exception's class name
+
+**Chosen:** `_describe(exc)` returns `str(exc) or type(exc).__name__`.
+**Why:** `httpx.ConnectError`/`ReadTimeout` frequently stringify to `''` on some platforms (the underlying OS-level error carries no message) -- storing that directly into `last_error` would leave a dead or retrying delivery with an empty, useless diagnostic field. Found by `tests/faults/test_webhook_retry.py`'s `timeout` case, which asserted `last_error` was truthy and failed against the un-fixed dispatcher.
+
+## Webhook metrics are structured log events, same as Phase 3/4
+
+**Chosen:** `webhook.fanned_out` / `.claimed` / `.delivered` / `.retry_scheduled` / `.dead` / `.stale_claim_swept` / `.manual_retry`, logged via the existing `structlog` setup, named to match SPEC.md §9's eventual `webhook_deliveries_total{status}` / `webhook_dlq_depth` counters.
+**Why:** identical reasoning to the Phase 3 and Phase 4 entries above -- there is still no `/metrics` endpoint until Phase 7.
+
+## `httpx` promoted from a dev-only to a runtime dependency
+
+**Chosen:** moved from `[project.optional-dependencies].dev` to `[project].dependencies`.
+**Why:** through Phase 4, `httpx` was only ever the *test* client (`app_client`, `fault_client`). Starting Phase 5, `ledger.webhooks.dispatcher` makes real outbound HTTP calls in production, so `ledger` itself now imports `httpx` outside of `tests/` -- leaving it dev-only would make a production `pip install .` (no `[dev]` extra) unable to import the package.
