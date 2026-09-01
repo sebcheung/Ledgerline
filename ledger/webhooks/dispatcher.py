@@ -77,6 +77,14 @@ class DispatchCycle:
     retried: int
 
 
+def _describe(exc: Exception) -> str:
+    """`httpx.ConnectError`/`ReadTimeout` frequently stringify to `''` (the
+    underlying OS error carries no message on some platforms) -- fall back
+    to the exception's class name so `last_error` is never an empty,
+    useless string."""
+    return str(exc) or type(exc).__name__
+
+
 def compute_backoff(
     attempt: int, *, base_seconds: float, max_seconds: float, rng: random.Random
 ) -> float:
@@ -236,16 +244,16 @@ class Dispatcher:
             try:
                 response = await self._client.post(row.url, content=body, headers=headers)
             except httpx.TimeoutException as exc:
-                return self._retry_outcome(row, response_code=None, error=str(exc))
+                return self._retry_outcome(row, response_code=None, error=_describe(exc))
             except httpx.TransportError as exc:
-                return self._retry_outcome(row, response_code=None, error=str(exc))
+                return self._retry_outcome(row, response_code=None, error=_describe(exc))
             except Exception as exc:  # a bug here must not strand the row in `delivering`
                 logger.error(
                     "webhook.delivery_unexpected_error",
                     extra={"delivery_id": str(row.id)},
                     exc_info=True,
                 )
-                return self._retry_outcome(row, response_code=None, error=str(exc))
+                return self._retry_outcome(row, response_code=None, error=_describe(exc))
 
         code = response.status_code
         if 200 <= code < 300:
