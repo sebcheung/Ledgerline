@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, String, Uuid, text
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Index, String, Uuid, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -11,6 +11,19 @@ from ledger.models.base import Base, UUIDPKMixin
 
 class SettlementLine(Base, UUIDPKMixin):
     __tablename__ = "settlement_lines"
+    __table_args__ = (
+        # The matcher's unmatched-line candidate scan (SPEC.md §7).
+        Index(
+            "ix_settlement_lines_unmatched",
+            "value_date",
+            postgresql_where=text("matched_transaction_id IS NULL"),
+        ),
+        # The anti-join half of "not already referenced by any
+        # settlement_lines.matched_transaction_id".
+        Index("ix_settlement_lines_matched_transaction_id", "matched_transaction_id"),
+        # GET /v1/settlements?batch_id=.
+        Index("ix_settlement_lines_batch_id", "batch_id"),
+    )
 
     external_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
