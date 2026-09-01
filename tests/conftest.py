@@ -199,6 +199,7 @@ class AccountSnapshot:
     currency: str
     allow_negative: bool
     is_suspense: bool
+    is_clearing: bool
 
 
 @pytest_asyncio.fixture
@@ -220,6 +221,7 @@ async def account_factory(
         currency: str = "USD",
         allow_negative: bool = False,
         is_suspense: bool = False,
+        is_clearing: bool = False,
     ) -> AccountSnapshot:
         async with session_factory() as session:
             row = (
@@ -231,6 +233,7 @@ async def account_factory(
                         currency=currency,
                         allow_negative=allow_negative,
                         is_suspense=is_suspense,
+                        is_clearing=is_clearing,
                     )
                     .returning(Account.id)
                 )
@@ -248,6 +251,7 @@ async def account_factory(
                 currency=currency,
                 allow_negative=allow_negative,
                 is_suspense=is_suspense,
+                is_clearing=is_clearing,
             )
 
     return make
