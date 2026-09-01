@@ -266,6 +266,30 @@ class ClearingAccountExists(LedgerError):
     status = 409
 
 
+class WebhookEndpointNotFound(LedgerError):
+    error_type = "/errors/webhook-endpoint-not-found"
+    title = "Webhook endpoint not found"
+    status = 404
+
+
+class WebhookDeliveryNotFound(LedgerError):
+    error_type = "/errors/webhook-delivery-not-found"
+    title = "Webhook delivery not found"
+    status = 404
+
+
+class DeliveryNotRetryable(LedgerError):
+    """`POST /v1/webhooks/deliveries/{id}/retry` requires the delivery to
+    be `dead` -- a `succeeded` row has nothing to replay, and a
+    `pending`/`delivering` row is already queued and re-queueing it would
+    race the dispatcher's own claim. Guarded by the same compare-and-swap
+    shape as `FindingAlreadyResolved`."""
+
+    error_type = "/errors/delivery-not-retryable"
+    title = "Webhook delivery is not retryable"
+    status = 409
+
+
 class ReconciliationRunFailed(LedgerError):
     """SPEC.md §7: "call verify_global_balance() and fail the run loudly if
     it does not hold." A server-side invariant violation, not a client
