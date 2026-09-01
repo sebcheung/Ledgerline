@@ -30,6 +30,13 @@ class WebhookDelivery(Base, UUIDPKMixin, CreatedAtMixin):
     __table_args__ = (
         UniqueConstraint("event_id", "endpoint_id", name="uq_webhook_deliveries_event_endpoint"),
         Index("ix_webhook_deliveries_status_next_attempt", "status", "next_attempt_at"),
+        # Serves GET /v1/webhooks/deliveries?endpoint_id=... plus its
+        # (created_at, id) cursor order in one index, and gives endpoint_id's
+        # FK an index it would otherwise lack. No index on `status` alone --
+        # four enum values, a heap filter wins at that selectivity (see
+        # docs/DECISIONS.md's existing argument for transactions.status).
+        Index("ix_webhook_deliveries_endpoint_id", "endpoint_id", "created_at", "id"),
+        Index("ix_webhook_deliveries_created_at", "created_at", "id"),
     )
 
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("outbox_events.id"), nullable=False)
