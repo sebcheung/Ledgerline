@@ -2,7 +2,7 @@
 
 See `SPEC.md` for the full build specification. This document is a short orientation to the layering, updated as phases land.
 
-## Layers (current: Phase 3)
+## Layers (current: Phase 4)
 
 - `ledger/models/` — SQLAlchemy 2.0 async ORM models, one module per table group. `ledger/models/__init__.py` imports every model class so `Base.metadata` is complete wherever it's needed (Alembic, tests). Indexes and partial-unique constraints are declared in `__table_args__` so they agree with what the migrations actually create — `alembic check` runs in CI specifically to catch the two from drifting.
 - `ledger/db/` — engine (`engine.py`), session factory (`session.py`), and `errors.py` (identifying which DB constraint fired inside a wrapped `IntegrityError`). `get_session()` is the FastAPI dependency; it never commits — the caller (a route handler or service function) owns the transaction boundary.
@@ -20,8 +20,14 @@ See `SPEC.md` for the full build specification. This document is a short orienta
   - `idempotent.py` (Phase 3) — `get_idempotent_request` (the FastAPI dependency: builds the endpoint scope string and, if a key is present, the request fingerprint — no I/O) and `IdempotentRequest.run(execute_fn)` (called from inside each idempotent route; owns the claim/execute/complete-or-release sequence). See "Idempotency" below.
   - `errors.py` — RFC 7807 `application/problem+json` rendering; registers handlers for `LedgerError`, `RequestValidationError`, `StarletteHTTPException`, `IdempotentReplay` (Phase 3), and the unhandled-exception catch-all.
   - `routes/accounts.py`, `routes/transactions.py`, `routes/admin.py` — the Phase 2 API surface (see below).
+  - `routes/settlements.py`, `routes/reconciliation.py` (Phase 4) — see "Reconciliation" below.
   - `health.py` — `/healthz` (liveness) and `/readyz` (DB reachability + Alembic-head check).
-- `migrations/` — Alembic, async-engine-driven. `0001_initial_schema` created every table, index, native enum, and the append-only trigger on `entries`; Phase 2 needed no new migration (every candidate was evaluated and rejected — see `docs/DECISIONS.md`).
+- `ledger/reconciliation/` (Phase 4) — framework-free, like `ledger.core`:
+  - `ingest.py` — `ingest_batch`: assigns a `batch_id`, dedups within the batch on `(external_ref, amount, currency, value_date)` (currency added beyond SPEC.md §7's literal tuple), stores each line's original payload in `raw`.
+  - `matcher.py` — `match`: the three-pass algorithm over two candidate lists loaded once per run, classifying in-memory and writing `settlement_lines.matched_transaction_id` directly; produces `ProposedFinding`s but never inserts them (see "Reconciliation" below for why).
+  - `resolver.py` — `resolve`: per-finding-type resolution policy (auto-resolve threshold, asset-leg/clearing-account selection, sign handling), called only with the findings-insert's `RETURNING` set. `resolve_manual_adjustment` backs the manual `post_adjustment` action, bypassing the threshold and letting `LedgerError` propagate instead of being swallowed.
+  - `runner.py` (not in SPEC.md §11's tree) — `execute_run`: advisory lock, DB-clock window, `matcher.match` → findings insert → `resolver.resolve` → `verify_global_balance`, all inside one transaction.
+- `migrations/` — Alembic, async-engine-driven. `0001_initial_schema` created every table, index, native enum, and the append-only trigger on `entries`; Phase 2 and Phase 3 needed no new migration. `0002_reconciliation_indexes` (Phase 4) is the first — it adds `accounts.is_clearing`, its guarding `CHECK`s, and every index `settlement_lines`/`reconciliation_findings` needed but `0001` never created (see `docs/DECISIONS.md`).
 
 ## Posting concurrency model
 
@@ -50,13 +56,25 @@ If `execute()` raises `DuplicateTransaction` (the `transactions.idempotency_key`
 
 A replayed response is served by raising `IdempotentReplay` from `run`, rendered by its own handler with `Idempotent-Replay: true`. The stored `response_body` is an envelope (`{"v", "body", "headers"}`, JSONB, no schema change) so a replay can carry `Location` without coupling the generic protocol to transaction-shaped responses.
 
+## Reconciliation (Phase 4)
+
+`POST /v1/reconciliation/runs` runs synchronously inside the request, guarded by three layers: an idempotency claim (via `ReconciliationIdempotencyDep`, using a dedicated, longer TTL — `RECON_RUN_LOCK_TTL_SECONDS`, default 300s — than every other idempotent route's 30s, because a run over a window with real volume can legitimately take longer), a `pg_try_advisory_xact_lock` acquired as the first thing inside the idempotent `execute()` closure (409 `ReconciliationRunInProgress` on contention), and — for anything that still slips through — the same `transactions.idempotency_key` unique-constraint backstop every posting has.
+
+Inside one DB transaction: read `now()` from the DB connection (never the app clock, same reasoning as idempotency staleness) to derive `window_start`/`window_end`/`cutoff_at`; `matcher.match` classifies every transaction/settlement-line candidate in memory and writes `matched_transaction_id` directly; the classification is inserted into `reconciliation_findings` via `INSERT ... ON CONFLICT (finding_type, transaction_id, settlement_line_id) DO NOTHING RETURNING ...` against an **unconditional** `NULLS NOT DISTINCT` unique index (`uq_recon_findings_open`); `resolver.resolve` is called with, and only ever processes, that `RETURNING` set; `verify_global_balance` runs before commit and a failure raises `ReconciliationRunFailed`, rolling everything back (with a `status='failed'` audit row written separately, on its own connection, so the failure isn't erased along with the rollback).
+
+The index being unconditional (not scoped to `resolution = 'unresolved'`) and the resolver being driven off `RETURNING` (not the matcher's full classification) are the two load-bearing details that make a re-run over an unchanged window produce zero new findings and, critically, zero duplicate ledger adjustments — see `docs/DECISIONS.md` for the double-post hazard a resolution-scoped version would have reintroduced.
+
+Every auto-resolution posts through `post_transaction` with `source='reconciliation'` and a deterministic `recon-adjust:{finding_id}` idempotency key, wrapped in the resolver's own `session.begin_nested()` (distinct from, and not covered by, `posting.py`'s existing SAVEPOINT — see `docs/DECISIONS.md`). A degraded adjustment (no clearing/suspense account configured, `InsufficientFunds`, etc.) leaves the finding `unresolved` with a logged reason and never fails the run.
+
+`accounts.is_clearing` (one per currency, mirroring `is_suspense`) is the resolver's "implied asset account" for `unexpected_settlement` and (via a fallback, when a transaction has no single non-clearing asset leg) `amount_mismatch` adjustments.
+
 ## Transaction boundary
 
 Route handler calls a `ledger.core` service function → the service never commits → the handler commits explicitly. `get_session()`'s `async with` block rolls back anything left open if a handler raises before committing. `ledger.core.idempotency.claim_key` (and its counterpart `release_key`) are the sole exceptions — see "Idempotency" above.
 
 ## Error contract
 
-Every `LedgerError` subclass declares a stable `error_type` (an RFC 7807 `type` URI, kept relative exactly as SPEC.md §9 writes it), a `title`, an HTTP `status`, and (Phase 3) an optional `headers` mapping (e.g. `DuplicateTransaction`'s `Retry-After: 1`). `ledger/api/errors.py` renders these — and framework-level failures (validation errors, generic `HTTPException`, unhandled exceptions, and Phase 3's `IdempotentReplay`) — as `application/problem+json` (`IdempotentReplay` is the one exception rendered as a plain success body instead, since a replay isn't a failure). Spec-named URIs: `/errors/unbalanced-transaction` (422), `/errors/insufficient-funds` (422), `/errors/currency-mismatch` (422), `/errors/account-not-found` (404), `/errors/idempotency-conflict` (409, `DuplicateTransaction` — both the raw unique-constraint backstop *and*, via the module-local alias `IdempotencyConflict` in `ledger.core.idempotency`, the in-flight-lock conflict SPEC.md §6 describes; see `docs/DECISIONS.md` for why these share one URI), `/errors/idempotency-key-reuse` (422, Phase 3), `/errors/already-reversed` (409). Extensions: `/errors/transaction-not-found` (404), `/errors/suspense-account-exists` (409), `/errors/invalid-transaction` / `/errors/invalid-money` / `/errors/invalid-currency` (422), `/errors/invalid-cursor` (400), `/errors/validation-error` (422), `/errors/internal` (500), plus the generic `/errors/http-<status>` fallback for other framework HTTP errors; Phase 3 adds `/errors/idempotency-key-scope-conflict` (422), `/errors/idempotency-state` (500), `/errors/invalid-request-body` (400, unreachable through the API today).
+Every `LedgerError` subclass declares a stable `error_type` (an RFC 7807 `type` URI, kept relative exactly as SPEC.md §9 writes it), a `title`, an HTTP `status`, and (Phase 3) an optional `headers` mapping (e.g. `DuplicateTransaction`'s `Retry-After: 1`). `ledger/api/errors.py` renders these — and framework-level failures (validation errors, generic `HTTPException`, unhandled exceptions, and Phase 3's `IdempotentReplay`) — as `application/problem+json` (`IdempotentReplay` is the one exception rendered as a plain success body instead, since a replay isn't a failure). Spec-named URIs: `/errors/unbalanced-transaction` (422), `/errors/insufficient-funds` (422), `/errors/currency-mismatch` (422), `/errors/account-not-found` (404), `/errors/idempotency-conflict` (409, `DuplicateTransaction` — both the raw unique-constraint backstop *and*, via the module-local alias `IdempotencyConflict` in `ledger.core.idempotency`, the in-flight-lock conflict SPEC.md §6 describes; see `docs/DECISIONS.md` for why these share one URI), `/errors/idempotency-key-reuse` (422, Phase 3), `/errors/already-reversed` (409). Extensions: `/errors/transaction-not-found` (404), `/errors/suspense-account-exists` (409), `/errors/invalid-transaction` / `/errors/invalid-money` / `/errors/invalid-currency` (422), `/errors/invalid-cursor` (400), `/errors/validation-error` (422), `/errors/internal` (500), plus the generic `/errors/http-<status>` fallback for other framework HTTP errors; Phase 3 adds `/errors/idempotency-key-scope-conflict` (422), `/errors/idempotency-state` (500), `/errors/invalid-request-body` (400, unreachable through the API today). Phase 4 adds `/errors/reconciliation-run-in-progress` (409, `Retry-After: 5` — a new slot, not a reuse of `DuplicateTransaction`'s), `/errors/reconciliation-run-not-found` / `/errors/reconciliation-finding-not-found` (404), `/errors/finding-already-resolved` (409), `/errors/invalid-finding-resolution` (422), `/errors/clearing-account-exists` (409), `/errors/reconciliation-run-failed` (500).
 
 ## Pagination
 
@@ -64,8 +82,12 @@ Every `LedgerError` subclass declares a stable `error_type` (an RFC 7807 `type` 
 
 ## Outbox
 
-`transaction.posted` and `transaction.reversed` events are written to `outbox_events` inside the same DB transaction as the ledger write, starting in Phase 2 — this is what gives the outbox pattern its atomicity guarantee, even though the dispatcher (fan-out to `webhook_deliveries`, HTTP delivery with retries) doesn't exist until Phase 5. A reversal emits *both* events: `transaction.posted` for the reversal transaction itself (it is a real posting) and `transaction.reversed` describing the original.
+`transaction.posted` and `transaction.reversed` events are written to `outbox_events` inside the same DB transaction as the ledger write, starting in Phase 2 — this is what gives the outbox pattern its atomicity guarantee, even though the dispatcher (fan-out to `webhook_deliveries`, HTTP delivery with retries) doesn't exist until Phase 5. A reversal emits *both* events: `transaction.posted` for the reversal transaction itself (it is a real posting) and `transaction.reversed` describing the original. Phase 4's reconciliation adjustments introduce no new event type — they post through `post_transaction` like any other transaction, so `transaction.posted` covers them for free.
 
 ## Not yet implemented (later phases, per `SPEC.md` §12)
 
-`ledger/reconciliation/`, `ledger/webhooks/dispatcher.py` and `signing.py`, `worker/`, `dashboard/` all exist as empty package stubs so later phases don't require restructuring — they carry no logic yet.
+`ledger/webhooks/dispatcher.py` and `signing.py`, `worker/`, `dashboard/` all exist as empty package stubs so later phases don't require restructuring — they carry no logic yet. (`ledger/reconciliation/` is Phase 4 and is no longer a stub.)
+
+## Known, accepted gap (Phase 4)
+
+A transaction reversed *after* its settlement line already matched leaves a settled line against a now-net-zero ledger effect; no `SPEC.md` §7 finding type detects this. Not fixed — see `docs/DECISIONS.md` Phase 4 for why.
