@@ -74,6 +74,13 @@ markers = [
 filterwarnings = [
   "error",
   "ignore::DeprecationWarning:testcontainers.*",
+  # Phase 5's mock webhook receiver (tests/mock_receiver) runs a real
+  # uvicorn server so fault tests can produce genuine socket-level
+  # failures (ASGITransport can't). uvicorn's websocket protocol import
+  # trips websockets' own legacy-module deprecation warning even though
+  # this app never uses websockets -- see docs/DECISIONS.md Phase 5.
+  "ignore::DeprecationWarning:uvicorn.*",
+  "ignore::DeprecationWarning:websockets.*",
   # asyncio's ProactorEventLoop (Windows) tears down asyncpg's sockets on
   # garbage collection rather than explicit close, which surfaces as
   # unraisable ResourceWarning/RuntimeWarning noise during test teardown.

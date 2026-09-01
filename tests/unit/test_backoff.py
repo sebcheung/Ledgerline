@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ledger.webhooks.dispatcher import compute_backoff
+from ledger.webhooks.dispatcher import _describe, compute_backoff
 
 BASE = 1.0
 CAP = 3600.0
@@ -53,3 +53,13 @@ def test_backoff_can_return_zero() -> None:
 
     delay = compute_backoff(1, base_seconds=BASE, max_seconds=CAP, rng=ZeroRng())
     assert delay == 0.0
+
+
+def test_describe_uses_the_message_when_present() -> None:
+    assert _describe(ValueError("boom")) == "boom"
+
+
+def test_describe_falls_back_to_the_class_name_for_a_message_less_exception() -> None:
+    # httpx.ConnectError/ReadTimeout frequently stringify to "" -- an empty
+    # last_error would be useless for debugging a dead delivery.
+    assert _describe(ConnectionError()) == "ConnectionError"
