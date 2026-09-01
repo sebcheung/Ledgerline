@@ -7,6 +7,7 @@ from ledger.api.routes.admin import router as admin_router
 from ledger.api.routes.reconciliation import router as reconciliation_router
 from ledger.api.routes.settlements import router as settlements_router
 from ledger.api.routes.transactions import router as transactions_router
+from ledger.api.routes.webhooks import router as webhooks_router
 from ledger.observability.logging import configure_logging
 from ledger.observability.middleware import RequestIdMiddleware
 
@@ -21,6 +22,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router, prefix="/v1", tags=["admin"])
     app.include_router(settlements_router, prefix="/v1", tags=["settlements"])
     app.include_router(reconciliation_router, prefix="/v1", tags=["reconciliation"])
+    app.include_router(webhooks_router, prefix="/v1", tags=["webhooks"])
     register_error_handlers(app)
     return app
 
