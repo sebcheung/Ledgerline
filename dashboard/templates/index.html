@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block header_actions %}
+<form hx-post="/dashboard/demo" hx-target="#toast" hx-swap="innerHTML" hx-disabled-elt="this">
+  <button type="submit"{% if not demo_enabled %} disabled title="Set DEMO_ENABLED=true to try this"{% endif %}>
+    Run demo scenario
+  </button>
+</form>
+{% endblock %}
+
+{% block content %}
+<div hx-ext="sse" sse-connect="/dashboard/sse">
+  <section id="balances" aria-label="Account balances" sse-swap="balances">
+    {% include "partials/_balances.html" %}
+  </section>
+
+  <section id="transactions" aria-label="Recent transactions" sse-swap="transactions">
+    {% include "partials/_transactions.html" %}
+  </section>
+
+  <section id="reconciliation" aria-label="Reconciliation" sse-swap="reconciliation">
+    {% include "partials/_reconciliation.html" %}
+  </section>
+
+  <section id="webhooks" aria-label="Webhook delivery queue" sse-swap="webhooks">
+    {% include "partials/_webhooks.html" %}
+  </section>
+</div>
+{% endblock %}
