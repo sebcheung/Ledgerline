@@ -1,0 +1,56 @@
+<h2>Reconciliation</h2>
+
+<h3>Run history</h3>
+{% if runs %}
+<table>
+  <thead>
+    <tr><th>Started</th><th>Status</th><th>Window</th></tr>
+  </thead>
+  <tbody>
+    {% for r in runs %}
+    <tr>
+      <td>{{ r.started_at.isoformat() }}</td>
+      <td>{{ r.status.value }}</td>
+      <td>{{ r.window_start.date() }} – {{ r.window_end.date() }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No reconciliation runs yet.</p>
+{% endif %}
+
+<h3>Open drift, by type</h3>
+{% if findings_summary %}
+<table>
+  <thead>
+    <tr><th>Finding type</th><th>Resolution</th><th>Count</th></tr>
+  </thead>
+  <tbody>
+    {% for f in findings_summary %}
+    <tr>
+      <td>{{ f.finding_type.value }}</td>
+      <td><span class="{{ f.resolution | badge_class }}">{{ f.resolution.value }}</span></td>
+      <td>{{ f.count }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No findings yet.</p>
+{% endif %}
+
+<h3>Latest run's findings</h3>
+{% if findings %}
+<ul>
+  {% for finding in findings %}
+  <li>
+    {{ finding.finding_type.value }} —
+    <span class="{{ finding.resolution | badge_class }}">{{ finding.resolution.value }}</span>
+    {% if finding.delta_amount is not none %}(delta {{ finding.delta_amount }}){% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No findings for the latest run.</p>
+{% endif %}

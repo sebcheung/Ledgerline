@@ -1,0 +1,41 @@
+<h2>Webhook delivery queue</h2>
+<p class="dlq-depth">DLQ depth: <strong>{{ summary.dlq_depth }}</strong></p>
+
+<table>
+  <thead>
+    <tr><th>Status</th><th>Count</th></tr>
+  </thead>
+  <tbody>
+    {% for status, count in summary.counts.items() %}
+    <tr>
+      <td><span class="{{ status | badge_class }}">{{ status.value }}</span></td>
+      <td>{{ count }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if deliveries %}
+<table>
+  <thead>
+    <tr><th>Event</th><th>Endpoint</th><th>Status</th><th>Attempt</th><th>Retry</th><th>Last error</th></tr>
+  </thead>
+  <tbody>
+    {% for d in deliveries %}
+    <tr>
+      <td>{{ d.event_type }}</td>
+      <td>{{ d.endpoint_url }}</td>
+      <td>
+        <span class="{{ d.status | badge_class }}">{{ d.status.value }}</span>
+        {% if d.claim_is_stale %}<span class="badge badge-pending">stale claim</span>{% endif %}
+      </td>
+      <td>{{ d.attempt_count }}/{{ max_attempts }}</td>
+      <td>{{ d.seconds_until_retry | countdown }}</td>
+      <td>{{ d.last_error or "—" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No deliveries in flight.</p>
+{% endif %}

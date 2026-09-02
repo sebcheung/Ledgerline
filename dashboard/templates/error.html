@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block title %}Ledgerline — {{ status }}{% endblock %}
+
+{% block content %}
+<div class="error-page">
+  <h2>{{ status }}</h2>
+  <p>{{ detail }}</p>
+  {% if request_id %}<p class="muted">request_id: {{ request_id }}</p>{% endif %}
+</div>
+{% endblock %}
