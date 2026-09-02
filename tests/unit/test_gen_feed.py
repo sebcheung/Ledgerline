@@ -1,11 +1,11 @@
-"""Pure unit tests for `scripts.gen_feed.generate_feed` -- no DB required.
-The fault suite (`tests/faults/test_recon_drift.py`) imports this same
-function so drift injection is exercised by exactly one code path."""
+"""Pure unit tests for `ledger.reconciliation.feed.generate_feed` -- no DB
+required. The fault suite (`tests/faults/test_recon_drift.py`) imports this
+same function so drift injection is exercised by exactly one code path."""
 
 import random
 from datetime import date
 
-from scripts.gen_feed import DriftConfig, FeedTransaction, generate_feed
+from ledger.reconciliation.feed import DriftConfig, FeedTransaction, generate_feed
 
 
 def _txn(ref: str = "ref-1", amount: int = 1000, currency: str = "USD") -> FeedTransaction:

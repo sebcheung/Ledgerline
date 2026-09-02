@@ -23,6 +23,11 @@ dependencies = [
   # calls to deliver webhooks. Was dev-only through Phase 4 (test client
   # only).
   "httpx>=0.27,<0.28",
+  # Runtime as of Phase 6: dashboard/ renders Jinja2 templates and ships in
+  # the wheel (see [tool.hatch.build.targets.wheel] below), so a production
+  # `pip install .` must import it without the [dev] extra -- same
+  # reasoning as the httpx promotion above.
+  "jinja2>=3.1,<4",
 ]
 
 [project.optional-dependencies]

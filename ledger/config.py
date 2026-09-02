@@ -43,6 +43,26 @@ class Settings(BaseSettings):
     webhook_connect_timeout_seconds: float = 5.0
     webhook_read_timeout_seconds: float = 5.0
 
+    # Used starting Phase 6 (dashboard + demo scenario, SPEC.md §12).
+    dashboard_enabled: bool = True
+    dashboard_sse_interval_seconds: float = 2.0
+    dashboard_sse_keepalive_seconds: float = 15.0
+    # A hard lifetime cap on one SSE stream. The browser's EventSource
+    # reconnects automatically, so ending the stream is invisible to the
+    # user and bounds any generator a missed disconnect would otherwise leak.
+    dashboard_sse_max_stream_seconds: float = 3600.0
+    dashboard_recent_transactions_limit: int = 25
+    dashboard_recent_runs_limit: int = 10
+    dashboard_queue_limit: int = 50
+
+    # The demo scenario writes real ledger rows and registers webhook
+    # endpoints pointed at deliberately failing URLs -- off by default, and
+    # refused outright in production regardless of this flag (see
+    # dashboard/views.py).
+    demo_enabled: bool = False
+    demo_retry_endpoint_url: str = "http://127.0.0.1:9/hook"
+    demo_self_base_url: str = "http://127.0.0.1:8000"
+
 
 @lru_cache
 def get_settings() -> Settings:
