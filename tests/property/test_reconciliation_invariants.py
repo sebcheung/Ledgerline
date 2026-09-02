@@ -6,8 +6,8 @@ auto-resolution can't corrupt the ledger.
 Reuses `assert_all_invariants` (raw-SQL, independent of
 `ledger.core.invariants`, same convention as
 `tests/property/test_ledger_invariants.py`) and the same
-`generate_feed`/`DriftConfig` drift injection `scripts/gen_feed.py`'s CLI
-and the fault suite both use.
+`generate_feed`/`DriftConfig` drift injection `ledger.reconciliation.feed`
+provides, which `scripts/gen_feed.py`'s CLI and the fault suite both use.
 """
 
 import random
@@ -24,10 +24,10 @@ from ledger.core.errors import CurrencyMismatch, InsufficientFunds, UnbalancedTr
 from ledger.core.posting import EntryRequest, post_transaction
 from ledger.models.accounts import Account
 from ledger.models.balances import AccountBalance
+from ledger.reconciliation.feed import DriftConfig, FeedTransaction, generate_feed
 from ledger.reconciliation.ingest import ingest_batch
 from ledger.reconciliation.runner import execute_run
 from ledger.schemas.settlements import SettlementLineIn
-from scripts.gen_feed import DriftConfig, FeedTransaction, generate_feed
 from tests.property.invariant_asserts import assert_all_invariants
 from tests.property.strategies import AccountSpec, PostOp, account_specs, post_ops
 from tests.support.db import truncate_all
