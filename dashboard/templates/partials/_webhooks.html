@@ -30,7 +30,10 @@
         {% if d.claim_is_stale %}<span class="badge badge-pending">stale claim</span>{% endif %}
       </td>
       <td>{{ d.attempt_count }}/{{ max_attempts }}</td>
-      <td>{{ d.seconds_until_retry | countdown }}</td>
+      <td>
+        <span class="countdown"
+              data-seconds="{{ d.seconds_until_retry if d.seconds_until_retry is not none else '' }}">{{ d.seconds_until_retry | countdown }}</span>
+      </td>
       <td>{{ d.last_error or "—" }}</td>
     </tr>
     {% endfor %}
