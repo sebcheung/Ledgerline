@@ -1,0 +1,26 @@
+<h2>Account balances</h2>
+{% if balances.accounts %}
+<table>
+  <thead>
+    <tr><th>Account</th><th>Type</th><th>Currency</th><th>Balance</th></tr>
+  </thead>
+  <tbody>
+    {% for a in balances.accounts %}
+    <tr>
+      <td>{{ a.name }}{% if a.is_suspense %} (suspense){% endif %}{% if a.is_clearing %} (clearing){% endif %}</td>
+      <td>{{ a.type.value }}</td>
+      <td>{{ a.currency }}</td>
+      <td>{{ a.balance | minor_units(a.currency) }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="totals">
+  Totals:
+  {% for t in balances.totals_by_currency %}
+    {{ t.total | minor_units(t.currency) }}{% if not loop.last %}, {% endif %}
+  {% endfor %}
+</p>
+{% else %}
+<p class="empty">No accounts yet.</p>
+{% endif %}
