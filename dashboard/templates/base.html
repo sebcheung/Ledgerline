@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Ledgerline{% endblock %}</title>
+  <link rel="stylesheet" href="/dashboard/static/ledgerline.css">
+  <script src="/dashboard/static/vendor/htmx.min.js"></script>
+  <script src="/dashboard/static/vendor/htmx-ext-sse.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <h1>Ledgerline</h1>
+    {% block header_actions %}{% endblock %}
+  </header>
+  <div id="toast" class="toast-slot"></div>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

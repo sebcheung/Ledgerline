@@ -13,6 +13,7 @@ generic HTTPException, and the unhandled-exception catch-all).
 
 import http
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
@@ -26,6 +27,8 @@ from ledger.api.idempotent import IdempotentReplay
 from ledger.core.errors import LedgerError
 
 logger = logging.getLogger(__name__)
+
+ProblemHandler = Callable[[Request, Exception], Awaitable[JSONResponse]]
 
 PROBLEM_CONTENT_TYPE = "application/problem+json"
 
@@ -171,6 +174,20 @@ def _status_phrase(status: int) -> str:
         return http.HTTPStatus(status).phrase
     except ValueError:
         return "Error"
+
+
+#: The JSON `application/problem+json` handlers, keyed by exception type,
+#: exposed publicly so `dashboard/errors.py` can delegate to the exact same
+#: behaviour for any request outside its own `/dashboard` prefix instead of
+#: reaching into these module-private functions directly -- the `/v1`
+#: contract must stay byte-identical regardless of what else is mounted on
+#: the app (see docs/DECISIONS.md Phase 6).
+PROBLEM_HANDLERS: dict[type[Exception], ProblemHandler] = {
+    LedgerError: _ledger_error_handler,
+    RequestValidationError: _validation_error_handler,
+    StarletteHTTPException: _http_exception_handler,
+    Exception: _unhandled_exception_handler,
+}
 
 
 def register_error_handlers(app: FastAPI) -> None:

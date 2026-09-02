@@ -1,0 +1,21 @@
+<h2>Recent transactions</h2>
+{% if transactions %}
+<table>
+  <thead>
+    <tr><th>Ref</th><th>Status</th><th>Source</th><th>Amount</th><th>Posted</th></tr>
+  </thead>
+  <tbody>
+    {% for t in transactions %}
+    <tr>
+      <td>{{ t.external_ref or "—" }}</td>
+      <td>{{ t.status.value }}</td>
+      <td>{{ t.source.value }}</td>
+      <td>{{ t.amount | minor_units(t.currency) }}</td>
+      <td>{{ t.created_at.isoformat() }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No transactions yet.</p>
+{% endif %}
