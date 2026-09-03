@@ -66,3 +66,7 @@ A `dead` delivery (its retry budget exhausted, or a non-429 4xx from the receive
 ## Reconciliation semantics
 
 The ledger is authoritative: a settlement line the ledger doesn't recognize can be automatically absorbed (via a suspense/clearing adjustment), but a ledger transaction the feed doesn't confirm is never assumed wrong (`missing_settlement` stays `unresolved` pending manual review, never auto-reversed). Auto-resolution is bounded — only differences at or below `RECON_AUTO_RESOLVE_THRESHOLD_MINOR` (default $5.00) are posted automatically; anything larger requires an explicit `POST /v1/reconciliation/findings/{id}/resolve`. Running a reconciliation over an unchanged window is safe to repeat: it reports no new findings and never re-adjusts an already-resolved one.
+
+## Load testing
+
+[`loadtest/`](loadtest/README.md) has a Locust scenario measuring throughput and posting-latency percentiles against a running instance. Manual only — see that README for why it isn't part of CI, and for recorded results.
