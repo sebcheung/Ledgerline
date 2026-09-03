@@ -415,3 +415,137 @@ with **no** `WHERE` clause, and findings inserted via `ON CONFLICT (finding_type
 
 **Chosen:** moved from `[project.optional-dependencies].dev` to `[project].dependencies`.
 **Why:** through Phase 4, `httpx` was only ever the *test* client (`app_client`, `fault_client`). Starting Phase 5, `ledger.webhooks.dispatcher` makes real outbound HTTP calls in production, so `ledger` itself now imports `httpx` outside of `tests/` -- leaving it dev-only would make a production `pip install .` (no `[dev]` extra) unable to import the package.
+
+# Phase 6 — Dashboard
+
+## Read models live in `ledger/readmodels/`, not `dashboard/`
+
+**Chosen:** framework-free query modules under `ledger/readmodels/` (`balances.py`, `transactions.py`, `reconciliation.py`, `webhooks.py`), following the same rule as `ledger/core` and `ledger/reconciliation` -- never import `fastapi`, `starlette`, or `jinja2`. `dashboard/` holds only templates, static assets, pure formatters (`dashboard/format.py`), thin route functions (`dashboard/views.py`), and the SSE generator (`dashboard/sse.py`).
+**Rejected:** `dashboard/queries.py`, which SPEC.md §11's literal repo tree would suggest (it names no query module at all for the dashboard). Not the first addition beyond that tree -- `ledger/reconciliation/runner.py` (Phase 4) is the precedent for adding a module the spec's tree doesn't name.
+**Why:** two independent reasons that happen to agree. First, the layering rule: cross-entry domain logic belongs under `ledger/`, regardless of which UI eventually consumes it. Second, the coverage gate (`[tool.coverage.run] source`) covers `ledger/` but not `dashboard/` by default -- putting the actual SQL under `ledger/` means it's gated from day one, and `dashboard/` stays thin enough that gating it too (see below) costs nothing.
+**Contrast with `worker/`:** `worker/webhook_worker.py` is excluded from the coverage gate because it is process-lifecycle plumbing with no decisions in it -- all its logic already lives in `ledger.webhooks.dispatcher`, which is gated. `dashboard/`'s views and SSE generator are comparably thin, which is exactly why extending the gate to include them (below) was cheap rather than risky.
+
+## The coverage gate is extended to `dashboard`, not to `worker` or `scripts`
+
+**Chosen:** `[tool.coverage.run] source = ["ledger", "dashboard"]` and `pytest --cov=ledger --cov=dashboard --cov-fail-under=90` in CI.
+**Why:** after the split above, `dashboard/` is a few hundred lines of pure formatters and thin routes, all of which the integration suite already drives end-to-end through `app_client`. Excluding it would leave the gate blind to real, testable work instead of protecting genuinely untestable plumbing. `worker/` (process lifecycle) and `scripts/` (CLI wrappers, `scripts/gen_feed.py`'s own drift logic already moved into `ledger.reconciliation.feed` this phase) stay excluded for the same reason they always were.
+**Sequencing:** the gate was widened in its own commit, landed last, after the dashboard code and its tests already existed -- so the real aggregate number was observed (96.32%, well above 90%) before the gate started enforcing it, rather than guessing.
+
+## SSE is periodic-poll, not Postgres LISTEN/NOTIFY
+
+**Chosen:** `dashboard/sse.py::event_stream` re-queries every panel on a timer (`DASHBOARD_SSE_INTERVAL_SECONDS`, default 2s) and emits only the panels whose rendered HTML changed since the last tick.
+**Rejected:** `LISTEN`/`NOTIFY`. It would need a new migration adding `pg_notify` triggers on `accounts`, `account_balances`, `transactions`, `reconciliation_findings`, and `webhook_deliveries` -- five-plus trigger objects `alembic check` cannot verify (it already can't compare `postgresql_where` predicates; it has no visibility into triggers at all). A dedicated `asyncpg` listener connection also can't be obtained safely through SQLAlchemy's pool without pinning one physical connection per open browser tab for the tab's entire lifetime, and NOTIFY payloads are not durable -- a poll fallback would still be needed for anything missed while disconnected, at which point LISTEN/NOTIFY adds cost without removing any.
+**Trigger condition to revisit:** many concurrent viewers, or a latency requirement tighter than the poll interval can meet.
+
+## The SSE loop opens a fresh session every tick; no shared broadcast queue
+
+**Chosen:** each tick does `async with session_factory() as session: ...`, opening and closing a session (and returning its pooled connection) before sleeping until the next tick.
+**Rejected:** a module-level `asyncio.Queue` or listener task shared across requests. `tests/conftest.py` documents exactly this hazard for engines: pytest-asyncio hands each test function its own event loop, so anything created on one test's loop and reused by a later test's loop surfaces as "another operation is in progress" or worse. A shared queue bound to whichever request happened to create it would reproduce that failure mode in production too, across multiple uvicorn workers.
+**Consequence:** N open dashboard tabs means N independent polling loops issuing the same handful of indexed queries every 2 seconds -- acceptable at this scale, and the simplest design that is also safe to test.
+
+## `StreamConfig` is injected as a FastAPI dependency, not a query parameter
+
+**Chosen:** `dashboard/views.py::get_stream_config` (and, for the same reason, `get_dashboard_session_factory` and `get_demo_engine`) are ordinary dependency functions, overridden in tests via `app.dependency_overrides` -- the exact mechanism `tests/conftest.py`'s `app_client` already uses for `get_session`.
+**Rejected:** a `?max_events=` query parameter to bound the stream for tests.
+**Why this is what makes SSE testable at all:** `StreamConfig.max_events` lets a test drain `event_stream` to completion instead of abandoning a live async generator. Under `filterwarnings = ["error"]`, an abandoned generator's eventual `RuntimeWarning`/unraisable `GeneratorExit` surfaces as a failure in an unrelated test's teardown -- and `pyproject.toml` already carries an `ignore:coroutine .* was never awaited:RuntimeWarning` entry (added for Windows/ProactorEventLoop asyncpg teardown) that would *mask* exactly this bug rather than catch it. A query parameter would put the same knob on the public HTTP surface, where a real client could pin it; a dependency keeps it internal to tests.
+**Also:** `get_dashboard_session_factory`/`get_demo_engine` exist for a second, independent reason -- see the next entry.
+
+## The dashboard never touches the module-level production `engine` directly
+
+**Chosen:** every dashboard code path that needs an `AsyncEngine` or session factory gets one through a dependency (`get_dashboard_session_factory`, `get_demo_engine`) rather than importing `ledger.db.session.async_session_factory` or `ledger.db.engine.engine` at the top of `dashboard/views.py`.
+**Why:** every other route's DB access goes through `get_session`, which `app_client`/`fault_client` override in every test. The SSE route and the demo route are the first dashboard code to touch the database *outside* that dependency -- had they imported the global engine directly, they would have been the first code in the whole test suite to actually exercise it, and `tests/conftest.py`'s own reasoning for why `db_engine` is function-scoped (pytest-asyncio hands each test its own event loop; a stale pooled connection from an earlier test's loop surfaces as "another operation is in progress") would have applied to them for free, in production as much as in tests.
+**Caught by:** the SSE integration tests hung when this indirection was still missing, before it was added -- the module-level engine's pooled connections, once created on one test's event loop, could not be reused by the next.
+
+## HTML fragments over the wire, not JSON
+
+**Chosen:** each SSE event's `data:` payload is the fully rendered HTML for that panel (`dashboard/templating.py::render_fragment`), consumed by htmx's `sse-swap` extension.
+**Rejected:** a JSON snapshot with client-side rendering.
+**Why:** one Jinja partial per panel serves the initial full-page render, the no-SSE fragment-refresh fallback, and every SSE update -- there is exactly one rendering path to keep correct, not two that could drift. `data:` cannot contain a raw newline, so `format_sse` splits multi-line HTML into one `data:` line per source line; `tests/unit/test_sse_format.py` pins this framing directly, since a bug here silently corrupts the stream rather than raising.
+**Escaping:** Starlette's `Jinja2Templates` autoescapes by default, which is security-relevant here, not cosmetic -- `webhook_deliveries.last_error` is a truncated response body from a third-party endpoint (`ledger/webhooks/dispatcher.py`) rendered directly into the queue view. `tests/unit/test_dashboard_templates.py::test_balances_fragment_escapes_account_name` pins that a hostile account name renders escaped.
+
+## Vendored htmx, not a CDN
+
+**Chosen:** `dashboard/static/vendor/htmx.min.js` and `htmx-ext-sse.js`, with version and SHA-256 recorded in `dashboard/static/vendor/VENDOR.md`.
+**Why:** `docker compose up` and the test suite must work with zero egress; a CDN `<script>` tag is also something an operator console showing ledger balances should not depend on executing from a host this repo doesn't control. Two vendored files keep the project's no-build-step property intact -- no npm, no bundler.
+**Cost, accepted:** a manual version-bump process (download, recompute the SHA-256, update `VENDOR.md` in the same commit) instead of a version pin in a lockfile.
+
+## Templates resolve from `Path(__file__)`, never a CWD-relative path
+
+**Chosen:** `dashboard/templating.py` builds `TEMPLATES_DIR`/`STATIC_DIR` from `Path(__file__).resolve().parent`, the same idiom `ledger/api/health.py` already uses for `alembic.ini`.
+**Why:** `Dockerfile` installs a wheel (`pip install .`, not `-e`), so a CWD-relative `"dashboard/templates"` would only ever have worked by coincidence of the image also copying the source tree next to the installed package. Hatchling's `packages = [...]` ships a first-party package's whole directory tree (all file types, filtered only by VCS ignores) with no extra `pyproject.toml` configuration -- confirmed by a CI step that builds the wheel and greps its contents for `dashboard/templates/index.html` and `dashboard/static/vendor/htmx.min.js`, since "hatchling just ships it" is an assumption worth pinning rather than trusting silently.
+
+## Retry countdowns and DLQ staleness are computed with the DB clock, inside the query
+
+**Chosen:** `ledger/readmodels/webhooks.py::load_delivery_queue` computes `seconds_until_retry` as `ceil(extract(epoch from next_attempt_at - now()))` in SQL, and `claim_is_stale` from the same `now()` compared against `webhook_stale_claim_seconds`.
+**Rejected:** returning the raw `next_attempt_at` and subtracting `datetime.now(UTC)` in Python (or a Jinja filter).
+**Why:** the same "DB clock, not the app clock" rule already established for idempotency staleness and reconciliation windows -- and, concretely, it's what makes the countdown assertable against an *exact* integer in a test (`backdate_next_attempt`-style helper, then assert `seconds_until_retry == 30`) instead of a fuzzy range.
+
+## The client-side countdown ticker never reads the browser's clock
+
+**Chosen:** `dashboard/static/ledgerline.js` counts down from the server-computed `data-seconds` value using only `Date.now()` deltas measured entirely on the client, between one SSE render and the next.
+**Why "skew-corrected":** the countdown's *absolute* correctness comes entirely from the server-side `seconds_until_retry` computed above; the browser's clock is only ever used to measure elapsed time since that value was rendered, never compared against the server's clock. A workstation with the wrong time of day therefore cannot produce a wrong countdown -- there is no clock comparison to get wrong.
+**Consequence for change detection:** an earlier version embedded a live `data-server-time` timestamp in the webhooks fragment for this purpose, which meant the fragment's HTML differed on every single tick (defeating per-panel change detection even when nothing else changed) -- caught by `tests/integration/test_dashboard_sse.py`'s heartbeat-only-on-no-change assertion. Removed; the ticker needs no server timestamp at all, only the per-element `data-seconds` value, since a DOM node freshly swapped in by SSE has no prior countdown state to preserve.
+
+## HTML error containment is a shim in front of the existing RFC 7807 handlers, not a replacement
+
+**Chosen:** `ledger/api/errors.py` exposes its handlers via a public `PROBLEM_HANDLERS` mapping (keyed by exception type). `dashboard/errors.py::install_html_error_handlers` re-registers the same exception types with a wrapper that delegates to the original handler for any request outside `/dashboard`, and renders an HTML page (or, for `HX-Request`, a 200 toast fragment -- htmx does not swap a non-2xx response body at all) for anything under it.
+**Why a public mapping instead of reaching into the module-private handler functions:** keeps the dependency arrow one-way (`dashboard -> ledger.api`, never the reverse) explicit and typed, without `dashboard/` importing names that look, and are named, private.
+**Pinned:** the existing `tests/unit/test_error_catalog.py` and `tests/integration/test_transactions_errors.py` stay green unmodified -- proof the `/v1` JSON contract is byte-identical to before this phase.
+**No new URIs:** Phase 6 introduces no new `error_type` values; the dashboard is read-only HTML, and its own failures render through this containment layer rather than the RFC 7807 catalog.
+
+## The dashboard is mounted into the existing `FastAPI()` app, not a second one
+
+**Chosen:** `create_app()` calls `app.include_router(dashboard_router, prefix="/dashboard", ...)` and `app.mount("/dashboard/static", StaticFiles(...))` on the same app instance, gated behind `settings.dashboard_enabled`.
+**Rejected:** a separate `FastAPI()` sub-application mounted at `/dashboard`.
+**Why:** `app.dependency_overrides` does not propagate into a mounted sub-application -- a second app would silently break `tests/conftest.py`'s `app_client` fixture's override of `get_session` for every dashboard test, and would need `RequestIdMiddleware` and the RFC 7807 handlers wired up a second time.
+**Flag for Phase 7:** `/dashboard/*` sits outside `/v1` and has no client contract to version, which is also why it will need to be explicitly excluded from Phase 7's API-key auth dependency rather than discovered as a gap then.
+
+## Demo scenario logic lives in `dashboard/demo.py`; `scripts/demo.py` is a thin CLI
+
+**Chosen:** `dashboard.demo.run_demo` holds all the logic; `scripts/demo.py` is `argparse` + `asyncio.run` over it, the same shape Phase 5 gave `worker/webhook_worker.py` around `ledger.webhooks.dispatcher`.
+**Why:** `scripts/` is in neither `[tool.hatch.build.targets.wheel].packages` nor the `Dockerfile`'s `COPY` list. A dashboard button handler that `import scripts.demo` would work from a source checkout and fail in the container and in the installed wheel -- the two places this app actually runs.
+**Moved as part of this:** `scripts/gen_feed.py`'s drift types and `generate_feed` moved to `ledger/reconciliation/feed.py` so `dashboard/demo.py` could reuse them without importing `scripts/` either; `scripts/gen_feed.py` now imports from there, and its own CLI is unaffected. `tests/faults/test_recon_drift.py` and `tests/unit/test_gen_feed.py` were repointed at the new module in the same commit.
+
+## `run_demo` is one transaction, single commit, for the advisory lock to actually hold
+
+**Chosen:** every write in `run_demo` -- accounts, transactions, the backdate `UPDATE`, settlement ingest, endpoint registration, the reconciliation run -- happens inside one uncommitted session transaction, committed exactly once near the end.
+**Rejected:** committing after each step (accounts, then transactions, then ingest, ...), which reads naturally as "a driver, like `Dispatcher`, owns its own transaction boundaries."
+**Why:** `pg_try_advisory_xact_lock` releases automatically at the *transaction's* end, not the session's. A session that commits partway through ends that transaction -- and its next statement may not even reuse the same pooled connection -- so the lock guarding "only one demo scenario at a time" would evaporate at the very first intermediate commit. `ledger.reconciliation.runner.execute_run` takes the equivalent lock the same way, for the same reason, and `run_demo` calls it *inside* its own transaction rather than letting it manage one itself.
+**Scope note:** `Dispatcher`'s "own its own transaction boundaries" pattern is still the right one for `Dispatcher` itself -- it uses a raw `AsyncEngine` with independent `engine.begin()` blocks per step and never needs a lock to span more than one of them. `run_demo`'s lock does need to span everything, which is what makes its shape different.
+
+## The demo backdates `transactions.created_at`, and only that column
+
+**Chosen:** `_post_and_backdate_transactions` posts through `post_transaction` normally, then runs one `UPDATE transactions SET created_at = now() - make_interval(days => :d) WHERE id IN (...)` over most of the batch, leaving a couple of transactions fresh.
+**Why backdating is necessary at all:** under the default `RECON_CUTOFF_LAG_HOURS` (24h), a transaction posted moments ago classifies as `in_flight` and is suppressed as drift, not reported -- a demo that only ever posts fresh transactions would show zero findings. Backdating most of them past the cutoff, while leaving a couple fresh, makes both `in_flight` suppression and real drift visible in the same run.
+**Why only `transactions`, not `entries`:** the `entries_no_update` trigger makes `entries.created_at` immutable by design (invariant 2), and `ledger.reconciliation.matcher` reads only `Transaction.created_at` for windowing and cutoff classification -- it never looks at `entries.created_at` at all. Backdating `entries` would be both impossible and unnecessary.
+**Accepted cosmetic artifact:** after a demo run, a transaction's `entries.created_at` (real posting time) and its own `created_at` (backdated) diverge. This is demo-only and never happens through any `/v1` route.
+
+## `perturb_max_minor` deliberately straddles the auto-resolve threshold
+
+**Chosen:** the demo's `DriftConfig(perturb_max_minor=800, ...)` against the default `RECON_AUTO_RESOLVE_THRESHOLD_MINOR` of 500.
+**Why:** a perturbation range entirely inside or entirely outside the threshold would make every `amount_mismatch` finding resolve the same way, which makes for a boring, uninformative demo. Straddling it means a single run reliably produces both `auto_resolved` and `unresolved` findings side by side -- the concrete thing that makes "recovery is visible" (SPEC.md §12 Phase 6's own phrase) actually true on screen. `tests/faults/test_demo_scenario.py` pins both outcomes for a specific seed (`rng_seed=0`, chosen by an offline search, documented inline) rather than asserting on the full histogram, since which seeds produce both outcomes is itself a statistical property of ~20 transactions, not a guaranteed one for every seed.
+
+## `run_demo` is re-runnable but deliberately not idempotent
+
+**Chosen:** each call generates a fresh `run_tag` and appends a new scenario -- new accounts only if missing, but always new transactions, a new settlement batch, new endpoints, and a new reconciliation run.
+**Rejected:** making a second click a no-op if a scenario already ran.
+**Why:** the button exists to make recovery *visible*. An idempotent second click that changes nothing on screen would read as a broken button, not a safe one. `tests/faults/test_demo_scenario.py::test_run_demo_is_rerunnable_and_appends_rather_than_replaces` pins the run count going 1 -> 2, not staying at 1.
+**Guarded differently:** concurrent double-clicks are handled by the advisory lock (previous entries), not by idempotency -- a second *simultaneous* click reports `ran=False` rather than interleaving with the first; a second *sequential* click is a legitimate new scenario.
+
+## The demo route 404s when disabled, rather than not being registered at all
+
+**Chosen:** `POST /dashboard/demo` is always registered; the handler itself checks `get_settings().demo_enabled` and raises `HTTPException(404)` if it's off.
+**Rejected:** conditionally calling `app.include_router` for the demo route only when enabled, mirroring how the whole dashboard router is gated behind `dashboard_enabled`.
+**Why:** `create_app()` reads settings once, at app-construction time, via an `lru_cache`d `get_settings()` -- conditionally registering a single route inside an already-thin router adds a second place that state has to be kept in sync with the setting, for a route (unlike the whole dashboard) with no wiring cost to always mounting it. 404, not 403: a disabled feature shouldn't reveal that it exists.
+**Default:** `demo_enabled` defaults to `False`; `docker-compose.yml` sets `DEMO_ENABLED=true` only for local `app`, never implied by `ENVIRONMENT`. It writes real transactions -- never enable it against a ledger you care about.
+
+## Phase 6 ships zero migrations
+
+**Chosen:** no new Alembic revision. All four dashboard views read existing tables and columns; SSE is stateless; the demo scenario writes only through existing service functions (`post_transaction`, `ingest_batch`, `execute_run`) plus one `UPDATE transactions SET created_at`, which needs no schema change.
+**Matches:** the Phase 2 and Phase 3 "ships zero migrations" precedent, elsewhere in this document.
+**Deferred, with trigger conditions:** an index on `reconciliation_runs.started_at` (currently a full-table seq scan + sort, free at one row per manual run -- revisit if `worker/recon_scheduler.py` starts producing runs continuously) and a partial index on `webhook_deliveries WHERE status = 'dead'` (revisit past roughly 10^6 delivery rows).
+
+## `jinja2` is a runtime dependency from the start
+
+**Chosen:** `jinja2>=3.1,<4` in `[project].dependencies`, not `[project.optional-dependencies].dev`.
+**Why:** identical reasoning to the `httpx` promotion above -- `dashboard/` ships in the wheel and imports `jinja2` outside of `tests/`, so a production `pip install .` (no `[dev]` extra) must be able to import it.
