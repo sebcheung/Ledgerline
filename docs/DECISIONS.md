@@ -549,3 +549,116 @@ with **no** `WHERE` clause, and findings inserted via `ON CONFLICT (finding_type
 
 **Chosen:** `jinja2>=3.1,<4` in `[project].dependencies`, not `[project.optional-dependencies].dev`.
 **Why:** identical reasoning to the `httpx` promotion above -- `dashboard/` ships in the wheel and imports `jinja2` outside of `tests/`, so a production `pip install .` (no `[dev]` extra) must be able to import it.
+
+---
+
+# Phase 7 — Deploy
+
+## API key auth: router-level `dependencies=`, not middleware or per-route
+
+**Chosen:** `V1_DEPENDENCIES = [Depends(require_api_key), Depends(enforce_rate_limit)]` (`ledger/api/deps.py`), attached to each `/v1` router's `include_router(..., dependencies=V1_DEPENDENCIES)` call in `ledger/api/main.py`.
+**Rejected:** ASGI middleware with a path allowlist; a per-route `Depends(...)` added to all eighteen `/v1` operations individually.
+**Why:** the exclusion of `/healthz`, `/readyz`, `/metrics`, and `/dashboard/*` becomes structural -- those routers simply never receive the dependency -- rather than a path allowlist a new route could silently fall outside of, which is exactly what `docs/DECISIONS.md` Phase 6 flagged as a risk to revisit here. Middleware also cannot participate in FastAPI's OpenAPI security-scheme generation; per-route `Depends()` would work but multiplies one line into eighteen for no benefit. `tests/unit/test_openapi.py` turns the resulting split into an enforced invariant instead of a convention to remember.
+
+## One `Unauthenticated` (401) for every auth failure mode
+
+**Chosen:** a missing header, wrong scheme, unknown key hash, and an `active=false` key all raise the same `Unauthenticated` (`/errors/unauthenticated`).
+**Rejected:** a distinct "key revoked" 403 for the inactive-key case.
+**Why:** a response that distinguishes "this key was never valid" from "this key was valid once" turns the endpoint into an oracle a credential-guessing attacker can use to confirm a hit -- unacceptable for a payments API. One error type for all four cases leaks nothing beyond "not currently usable."
+
+## The API key lookup is cached, with negative caching included
+
+**Chosen:** `ledger.api.auth.ApiKeyCache`, a TTL cache (`api_key_cache_ttl_seconds`, default 30s) from key hash to lookup result, storing `None` for unknown hashes as well as hits. One instance per `FastAPI` app (`app.state.api_key_cache`), never a module-level global.
+**Rejected:** no cache (a database round trip on every authenticated request); caching only positive lookups.
+**Why:** a DB round trip in front of every request would show up directly in the Locust p99 this same phase is asked to report. Negative caching matters independently: without it, a credential-guessing loop turns every guess into a database query, i.e. the cache would make guessing cheaper to send and more expensive to receive. Per-app instance (not global) is what makes `create_app()` produce a fresh, empty cache in every test -- the same reasoning `RateLimiter` below follows.
+**Trade-off, accepted:** revoking a key takes up to `api_key_cache_ttl_seconds` to propagate. Set to `0` for immediate revocation (bypasses the cache entirely, at the cost of a DB read per request).
+**No constant-time comparison needed:** the lookup is `WHERE key_hash = :h` against a unique index -- Postgres is comparing hashes, not a caller-supplied secret against a value the app echoes back, so there is no timing side channel exposing anything about the preimage.
+
+## No `auth_enabled` kill switch
+
+**Chosen:** API key auth is unconditional on every `/v1` route; no settings flag disables it.
+**Rejected:** an `auth_enabled: bool` setting, defaulting `True`, that tests (and only tests) would flip off.
+**Why:** unlike rate limiting (below), disabling auth degrades security, not just availability -- a single environment variable between a payments deployment and total exposure is an unacceptable footgun. It would also mean the ~20 pre-existing integration/fault test files never traverse the shipped auth code path, since they'd run with it off.
+
+## Existing tests keep passing by seeding a real key in the shared client fixtures
+
+**Chosen:** `tests/conftest.py::app_client` and `tests/faults/conftest.py::fault_client` both seed one shared test API key (`tests/support/auth.py::seed_api_key`) and send it as a Bearer token on every request they build.
+**Rejected:** `app.dependency_overrides[require_api_key]` returning a fake `AuthenticatedKey`, bypassing the real dependency.
+**Why:** the auth blast radius turned out to be two fixtures, not the ~20 files that call them -- every existing integration and fault test needed zero changes and now genuinely exercises real auth end to end, including the cache and the database lookup. A dependency override would have deleted that coverage from the entire suite. Both fixtures depend explicitly on `clean_database` (rather than relying on same-scope autouse ordering) so the seed provably runs after the per-test truncate.
+
+## Rate limiting: in-process token bucket, not Redis
+
+**Chosen:** `ledger.api.ratelimit.RateLimiter`, a per-key token bucket (100 req/s, burst 200) held in a plain dict on `app.state.rate_limiter`, refilled lazily on read.
+**Rejected:** a shared store (Redis) for a limit enforced across all app processes/machines.
+**Why:** SPEC.md §9 says "in-process" explicitly, and SPEC.md §1 excludes horizontal scaling as a goal.
+**Consequence, accepted:** the effective limit is per-*worker process*, not per-deployment -- N uvicorn workers or N machines would give N× the nominal limit. `fly.toml` pins exactly one uvicorn worker (`--workers 1`) per single web machine to keep "100/s burst 200" true for the topology this ships to; this is also what keeps the in-process metric counters (below) correct, so both constraints are satisfied by the same one decision.
+
+## Rate limiting has a kill switch; auth does not
+
+**Chosen:** `rate_limit_enabled: bool = True`, checked dynamically inside `enforce_rate_limit` (same pattern as `dashboard/views.py`'s `demo_enabled` check).
+**Why:** disabling the rate limit degrades availability, not security -- a defensible flag, unlike auth's. The Locust load test (below) needs to disable or loosen it for a clean, unthrottled run.
+
+## Metrics: a dedicated `CollectorRegistry`, counters at call sites, gauges from the database at scrape time
+
+**Chosen:** `ledger.observability.metrics.REGISTRY`, a `CollectorRegistry()` instance, not `prometheus_client`'s process-global default. In-process `Counter`/`Histogram` objects for events that only happen inside the API process (transactions posted, entries written, idempotency replays/conflicts, posting latency); `Gauge`s for `webhook_deliveries_total`, `webhook_dlq_depth`, and `reconciliation_findings_total`, refreshed from their tables by `refresh_db_gauges` at scrape time.
+**Rejected:** the global default registry; in-process counters for the webhook/reconciliation metrics; a custom `prometheus_client.registry.Collector` for the DB-derived gauges.
+**Why a dedicated registry:** keeps `process_*`/`python_gc_*` default collectors out of `/metrics` output, and makes double-registration (which raises) impossible across the many `create_app()` calls the test suite makes in one process -- metrics are module-level, defined once at import.
+**Why gauges, not counters, for webhook/reconciliation metrics:** `ledger.webhooks.dispatcher` runs inside `worker/webhook_worker.py`, a separate process with no HTTP server of its own -- an in-process counter there could never be scraped. The same is true of any reconciliation run triggered outside the API process. Reading the table is the only source of truth correct across processes and restarts.
+**Why not a custom `Collector`:** `prometheus_client` collectors are synchronous, and refreshing these gauges needs an `await`ed database query -- the route handler awaits `refresh_db_gauges` directly instead.
+
+## Idempotency replays and conflicts are counted at the RFC 7807 handlers, not at `ledger.core.idempotency`'s own log sites
+
+**Chosen:** `IDEMPOTENCY_REPLAYS.inc()` in `ledger/api/errors.py::_idempotent_replay_handler`; `IDEMPOTENCY_CONFLICTS.inc()` in `_ledger_error_handler` when `exc.error_type == "/errors/idempotency-conflict"`.
+**Rejected:** incrementing next to `ledger.core.idempotency`'s existing `idempotency.replayed`/`idempotency.duplicate_backstop` log events, the way `transactions_posted_total` is counted next to `posting.py`'s own log event.
+**Why:** `ledger.api.idempotent.IdempotentRequest._resolve_duplicate` sometimes *converts* a `DuplicateTransaction` into an `IdempotentReplay` (when the original request has since completed) -- counting at the log sites inside `ledger.core.idempotency` would double-count or miscount that conversion. Counting at the two RFC 7807 handlers instead gives exactly one increment per response the client actually saw, regardless of which internal path produced it.
+
+## `GET /metrics` is deliberately unauthenticated
+
+**Chosen:** mounted with no `V1_DEPENDENCIES`, gated only by a `metrics_enabled` setting.
+**Why:** Fly's built-in Prometheus scraper polls over the private network (`6PN`) and cannot send an `Authorization` header. This is the one deliberately-open data surface besides health and the dashboard; request volume and DLQ depth become readable to anything on the private network, which is accepted as the cost of using the platform's built-in scraping rather than standing up a separate metrics-auth mechanism SPEC.md §9 doesn't ask for.
+
+## The idempotency retention sweep runs from a scheduled machine, not a background loop or an HTTP endpoint
+
+**Chosen:** `ledger.core.idempotency.sweep_idempotency_keys` (a plain `DELETE ... WHERE status = 'completed' AND created_at < ...`, interval computed in SQL) plus `ledger.admin.sweep`, a one-shot CLI, run from a Fly scheduled machine (`docs/DEPLOY.md`).
+**Rejected:** folding the sweep into `worker/webhook_worker.py`'s 1-second poll loop; an admin HTTP endpoint.
+**Why:** a webhook dispatcher sweeping idempotency keys would be a layering smell and would need its own interval bookkeeping bolted onto an unrelated loop. An HTTP endpoint invents API surface SPEC.md §9 doesn't list, and a long-running `DELETE` behind a request timeout is the wrong shape. The one-shot CLI is trivially testable (call the function directly) and needs no scheduling logic of its own to get wrong.
+**Index is non-partial:** `ix_idempotency_keys_created_at` covers every row, not just `status = 'completed'` -- every row transitions to `completed` eventually, so a partial index would add write-time maintenance for no read-time benefit, and a future "reap abandoned `in_progress` rows" sweep would want the full index anyway.
+
+## `worker/recon_scheduler.py` stays stubbed
+
+**Chosen:** left as the `raise SystemExit("not implemented yet")` stub it has been since Phase 1.
+**Why:** Phase 7's spec line (SPEC.md §12) names API key auth, rate limiting, `/metrics`, OpenAPI descriptions, Fly.io deploy, CD, the load test, and the README diagram -- not a reconciliation scheduler. The one thing that would have justified opening it -- "somewhere to run a periodic job from" -- is served instead by the retention sweep's Fly scheduled machine, which needs no daemon process, no interval bookkeeping, and no tests for scheduling logic. `POST /v1/reconciliation/runs` is already idempotent and advisory-locked, so any external scheduler can already drive periodic reconciliation without this file existing.
+**Not an oversight:** recorded here explicitly so a future reader sees a decision, not a gap.
+
+## OpenAPI problem responses: `"model": Problem` alone, not combined with a `"content"` override
+
+**Chosen:** `PROBLEM_RESPONSES` (`ledger/api/openapi.py`) documents each RFC 7807 status via `{"model": Problem, "description": "..."}` only.
+**Rejected:** adding `"content": {"application/problem+json": {}}` alongside `"model"` to make the generated schema show the real content-type.
+**Why:** FastAPI does not replace the media type when both are given -- it adds a second, empty `application/problem+json` entry next to the `application/json` one it generates from `"model"`, which documents the response *worse* (an empty schema under the correct media type, next to a populated schema under the wrong one) than accepting the understated `application/json` label alone. The mismatch between the documented and actual content-type is noted in each response's `description` instead.
+
+## Fly topology: one web machine, one worker machine, exactly one uvicorn worker
+
+**Chosen:** `fly.toml`'s `[processes]` defines `app` (`uvicorn ... --workers 1`) and `worker` (`python -m worker.webhook_worker`) as separate process groups, each on its own `[[vm]]`.
+**Why the second process group is not optional:** without it, `ledger.webhooks.dispatcher` never runs in production and every webhook delivery stays `pending` indefinitely -- the API process alone only ever fans out and enqueues deliveries, per Phase 5.
+**Why exactly one uvicorn worker:** both the in-process rate limiter and the in-process metric counters are only correct for a single process (see both entries above) -- `--workers 1` is the one line that keeps both of those decisions true simultaneously for the deployed topology, not two independent constraints that happened to agree.
+
+## `DATABASE_URL` is normalized to the asyncpg driver in `Settings`, not left to the provisioner
+
+**Chosen:** `Settings._normalize_database_url`, a `field_validator(mode="before")`, rewrites a bare `postgres://` or `postgresql://` prefix to `postgresql+asyncpg://`; an already-explicit `+driver` is left untouched.
+**Why:** `fly postgres attach` (and most managed-Postgres providers) sets `DATABASE_URL` in libpq form, but both `ledger/db/engine.py` and `migrations/env.py` feed the value straight into `create_async_engine`, which requires the `+asyncpg` driver suffix. Without this normalization, the very first deploy's `release_command` (`alembic upgrade head`) would fail before any traffic shifted -- a failure mode that a `docker-compose`-only development workflow (where `DATABASE_URL` is always written by hand, already in the right form) would never surface.
+
+## CD deploys on `workflow_run`, not `push`, and is a no-op until a secret exists
+
+**Chosen:** `.github/workflows/cd.yml` triggers on the `CI` workflow's `workflow_run: [completed]` event, gated further to `conclusion == 'success'`, `head_branch == 'main'`, and `event == 'push'`; every deploy step itself is additionally gated on `secrets.FLY_API_TOKEN != ''`.
+**Rejected:** triggering directly on `push: branches: [main]`, relying on `needs:` to gate on CI (not possible across separate workflow files).
+**Why `workflow_run`:** GitHub Actions has no cross-workflow `needs:` -- `workflow_run` is the mechanism for "run this only after that other workflow finished", and checking `conclusion == 'success'` is what actually gates on CI passing rather than merely having run.
+**Why pin to `head_sha`:** a `workflow_run` checkout defaults to the default branch's current tip, which can have moved past the exact commit CI validated by the time the CD job starts -- `ref: ${{ github.event.workflow_run.head_sha }}` pins to the validated commit.
+**Why `cancel-in-progress: false`:** cancelling a deploy mid-`release_command` (which runs `alembic upgrade head`) could leave a migration half-applied against a live database; a second push queues behind the first rather than pre-empting it.
+**Deploy-ready, not deployed:** every step that would actually touch Fly is conditioned on the `FLY_API_TOKEN` secret existing, so this workflow lands as a verified no-op -- see `docs/DEPLOY.md` for the manual `fly launch`/Postgres/secret steps this phase deliberately does not perform.
+
+## The Locust load test is manual, never CI-gated
+
+**Chosen:** `loadtest/locustfile.py`, run by hand against docker-compose or a real deployment; no CI job invokes it.
+**Rejected:** a CI job asserting a throughput or p99 threshold on every push.
+**Why:** a performance assertion on a shared, variable-capacity GitHub Actions runner is either loose enough to prove nothing or tight enough to fail on unrelated infrastructure noise, not genuine regressions. `loadtest/README.md` records observed numbers with the date and machine they came from instead, the same way this document records design decisions with their reasoning rather than enforcing them as executable rules.
+**Load test exercises a shared, contended account pair, not only per-user pairs:** without it, the scenario would never exercise the ordered `FOR UPDATE` locking `ledger.core.posting` is built around, and the reported throughput would be measuring an uncontended, unrepresentative best case.
