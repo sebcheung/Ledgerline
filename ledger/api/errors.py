@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse
 
 from ledger.api.idempotent import IdempotentReplay
 from ledger.core.errors import LedgerError
+from ledger.observability.metrics import IDEMPOTENCY_CONFLICTS, IDEMPOTENCY_REPLAYS
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,14 @@ async def _ledger_error_handler(request: Request, exc: Exception) -> JSONRespons
         logger.error("ledger_error", exc_info=exc)
     else:
         logger.warning("ledger_error", extra={"error_type": exc.error_type})
+    # Phase 7 (SPEC.md §9): counted here, not at ledger.core.idempotency's own
+    # log sites -- DuplicateTransaction (aliased IdempotencyConflict) is
+    # sometimes caught and converted into an IdempotentReplay by
+    # ledger.api.idempotent.IdempotentRequest._resolve_duplicate, so counting
+    # at the two RFC 7807 handlers gives exactly one increment per response
+    # the client actually saw, with no double counting.
+    if exc.error_type == "/errors/idempotency-conflict":
+        IDEMPOTENCY_CONFLICTS.inc()
     return problem_response(
         request,
         type_=exc.error_type,
@@ -154,6 +163,7 @@ async def _idempotent_replay_handler(request: Request, exc: Exception) -> JSONRe
     headers (e.g. `Location`) the original response carried."""
     assert isinstance(exc, IdempotentReplay)
     logger.info("idempotency_replay")
+    IDEMPOTENCY_REPLAYS.inc()
     headers = {**exc.envelope.get("headers", {}), "Idempotent-Replay": "true"}
     return JSONResponse(exc.envelope.get("body"), status_code=exc.status, headers=headers)
 
