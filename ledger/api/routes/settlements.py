@@ -17,7 +17,12 @@ from ledger.schemas.settlements import (
 router = APIRouter()
 
 
-@router.post("/settlements/ingest", response_model=SettlementIngestResponse, status_code=201)
+@router.post(
+    "/settlements/ingest",
+    response_model=SettlementIngestResponse,
+    status_code=201,
+    summary="Ingest a batch of external settlement lines",
+)
 async def ingest(payload: SettlementIngestRequest, session: SessionDep) -> SettlementIngestResponse:
     result = await ingest_batch(session, payload.lines)
     await session.commit()
@@ -26,7 +31,11 @@ async def ingest(payload: SettlementIngestRequest, session: SessionDep) -> Settl
     )
 
 
-@router.get("/settlements", response_model=Page[SettlementLineRead])
+@router.get(
+    "/settlements",
+    response_model=Page[SettlementLineRead],
+    summary="List ingested settlement lines, filtered by batch or match status",
+)
 async def list_settlements(
     session: SessionDep, query: Annotated[SettlementListQuery, Query()]
 ) -> Page[SettlementLineRead]:

@@ -18,6 +18,7 @@ from ledger.models.reconciliation import ReconciliationFinding, ReconciliationRu
 from ledger.reconciliation import runner
 from ledger.reconciliation.resolver import resolve_manual_adjustment
 from ledger.schemas.pagination import Page, decode_cursor, encode_cursor
+from ledger.schemas.problems import Problem
 from ledger.schemas.reconciliation import (
     FindingResolveAction,
     FindingResolveRequest,
@@ -29,7 +30,16 @@ from ledger.schemas.reconciliation import (
 router = APIRouter()
 
 
-@router.post("/reconciliation/runs", response_model=ReconciliationRunRead, status_code=201)
+@router.post(
+    "/reconciliation/runs",
+    response_model=ReconciliationRunRead,
+    status_code=201,
+    summary="Run reconciliation against ingested settlements",
+    description=(
+        "Accepts an `Idempotency-Key` header. Re-running with the same key "
+        "replays the original response rather than re-matching."
+    ),
+)
 async def create_run(
     session: SessionDep, response: Response, idem: ReconciliationIdempotencyDep
 ) -> ReconciliationRunRead:
@@ -54,7 +64,12 @@ async def create_run(
     return result.body
 
 
-@router.get("/reconciliation/runs/{run_id}", response_model=ReconciliationRunRead)
+@router.get(
+    "/reconciliation/runs/{run_id}",
+    response_model=ReconciliationRunRead,
+    responses={404: {"model": Problem, "description": "No reconciliation run with that id."}},
+    summary="Get a reconciliation run",
+)
 async def get_run(run_id: uuid.UUID, session: SessionDep) -> ReconciliationRunRead:
     row = (
         await session.execute(
@@ -85,7 +100,9 @@ async def get_run(run_id: uuid.UUID, session: SessionDep) -> ReconciliationRunRe
 
 
 @router.get(
-    "/reconciliation/runs/{run_id}/findings", response_model=Page[ReconciliationFindingRead]
+    "/reconciliation/runs/{run_id}/findings",
+    response_model=Page[ReconciliationFindingRead],
+    summary="List a reconciliation run's findings, filtered by resolution",
 )
 async def list_findings(
     run_id: uuid.UUID,
@@ -129,7 +146,13 @@ async def list_findings(
 
 
 @router.post(
-    "/reconciliation/findings/{finding_id}/resolve", response_model=ReconciliationFindingRead
+    "/reconciliation/findings/{finding_id}/resolve",
+    response_model=ReconciliationFindingRead,
+    responses={
+        404: {"model": Problem, "description": "No reconciliation finding with that id."},
+        409: {"model": Problem, "description": "The finding was already resolved."},
+    },
+    summary="Manually resolve a reconciliation finding",
 )
 async def resolve_finding(
     finding_id: uuid.UUID, payload: FindingResolveRequest, session: SessionDep
