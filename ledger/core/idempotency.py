@@ -373,3 +373,36 @@ async def load_key(session: AsyncSession, *, key: str, fingerprint: str) -> Stor
             idempotency_key=key,
         )
     return StoredResponse(status=row.response_status, body=row.response_body)
+
+
+async def sweep_idempotency_keys(session: AsyncSession, *, older_than_days: int) -> int:
+    """Phase 7 (SPEC.md §9): delete completed keys older than the retention
+    window, backed by `ix_idempotency_keys_created_at`
+    (migrations/versions/0004_idempotency_retention_index.py). Deferred
+    here from Phase 3 (docs/DECISIONS.md) until there was an operational
+    surface -- `ledger.admin.sweep` -- to run it from.
+
+    Only `completed` rows are ever eligible: an `in_progress` row still
+    holds a live claim (SPEC.md §6), and deleting one out from under a
+    slow-but-legitimate original request would let a retry re-execute it.
+
+    The interval is computed in SQL, not Python -- the same "DB clock, not
+    the app clock" rule `ledger.webhooks.dispatcher` and the read models
+    already follow, so a skewed application-host clock can't shrink or
+    widen the window this actually deletes against.
+
+    Never commits -- like every other function in this module except
+    `claim_key`/`release_key` (see the module docstring), the caller
+    (`ledger.admin.sweep`) owns the transaction boundary.
+    """
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            delete(IdempotencyKey).where(
+                IdempotencyKey.status == IdempotencyStatus.COMPLETED,
+                IdempotencyKey.created_at
+                < text("now() - make_interval(days => :days)").bindparams(days=older_than_days),
+            )
+        ),
+    )
+    return result.rowcount

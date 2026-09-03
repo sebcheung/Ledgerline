@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     # Authorization header. This flag is the only way to turn it off.
     metrics_enabled: bool = True
 
+    # Used starting Phase 7 (idempotency key retention sweep,
+    # docs/DECISIONS.md Phase 3 and Phase 7). Run from a Fly scheduled
+    # machine (python -m ledger.admin.sweep), not a background loop in this
+    # process -- see docs/DECISIONS.md Phase 7.
+    idempotency_retention_days: int = 30
+
 
 @lru_cache
 def get_settings() -> Settings:
