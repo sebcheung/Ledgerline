@@ -28,6 +28,10 @@ dependencies = [
   # `pip install .` must import it without the [dev] extra -- same
   # reasoning as the httpx promotion above.
   "jinja2>=3.1,<4",
+  # Runtime as of Phase 7: ledger.observability.metrics is imported by
+  # ledger.core.posting to increment SPEC.md §9's counters, so a bare
+  # `pip install .` must import it -- same reasoning as httpx/jinja2 above.
+  "prometheus-client>=0.20,<0.22",
 ]
 
 [project.optional-dependencies]
