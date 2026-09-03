@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     rate_limit_rps: float = 100.0
     rate_limit_burst: float = 200.0
 
+    # Used starting Phase 7 (GET /metrics, SPEC.md §9). Deliberately
+    # unauthenticated (see ledger/api/routes/metrics.py) -- Fly's built-in
+    # Prometheus scraper polls over the private network and cannot send an
+    # Authorization header. This flag is the only way to turn it off.
+    metrics_enabled: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:
