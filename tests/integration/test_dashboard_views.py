@@ -182,3 +182,55 @@ async def test_demo_route_is_disabled_by_default(app_client: AsyncClient) -> Non
     ledger rows."""
     response = await app_client.post("/dashboard/demo")
     assert response.status_code == 404
+
+
+async def test_demo_route_runs_the_scenario_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, db_engine: AsyncEngine
+) -> None:
+    """Exercises the demo route's success path end to end over real HTTP --
+    `dashboard.demo.run_demo` itself is covered in depth by
+    `tests/faults/test_demo_scenario.py`; this only pins that the route
+    wires it up correctly and renders the toast."""
+    from dashboard.views import get_demo_engine
+    from ledger.config import get_settings
+    from ledger.db.session import get_session
+
+    enabled_settings = get_settings().model_copy(update={"demo_enabled": True})
+    monkeypatch.setattr("dashboard.views.get_settings", lambda: enabled_settings)
+
+    from ledger.api.main import create_app
+
+    session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+
+    async def _override_get_session() -> AsyncGenerator[AsyncSession, None]:
+        async with session_factory() as session:
+            try:
+                yield session
+            finally:
+                await session.rollback()
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _override_get_session
+    app.dependency_overrides[get_demo_engine] = lambda: db_engine
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/dashboard/demo")
+        assert response.status_code == 200
+        assert "Demo scenario complete" in response.text
+
+
+def test_dashboard_dependency_helpers_return_the_expected_shapes() -> None:
+    """`get_stream_config`, `get_dashboard_session_factory`, and
+    `get_demo_engine` are plain FastAPI dependency functions -- every
+    integration test overrides them (necessarily: see their docstrings for
+    why touching the real production engine/settings from a test is
+    unsafe), so nothing else ever calls their actual bodies."""
+    from sqlalchemy.ext.asyncio import AsyncEngine as _AsyncEngine
+
+    from dashboard.sse import StreamConfig
+    from dashboard.views import get_dashboard_session_factory, get_demo_engine, get_stream_config
+
+    assert isinstance(get_stream_config(), StreamConfig)
+    assert isinstance(get_demo_engine(), _AsyncEngine)
+    assert get_dashboard_session_factory() is not None
