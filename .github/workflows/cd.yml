@@ -1,0 +1,53 @@
+name: CD
+
+# Fires when the CI workflow completes, not on `push` directly -- this is
+# a gate on CI actually having passed, not just having run. Two separate
+# workflow files can't share a `needs:`, so `workflow_run` is the
+# equivalent for cross-workflow dependencies. Guarded further below to
+# only deploy a CI run that was itself triggered by a push to main.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+concurrency:
+  # No cancel-in-progress: cancelling mid-release_command (which runs
+  # `alembic upgrade head`) could leave a migration half-applied on a live
+  # database. A queued second deploy waits instead of pre-empting the first.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_run defaults to the default branch's current tip, which
+          # can have moved past the commit CI actually validated -- pin to
+          # the exact SHA that produced the green CI run.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Every step below is a clean no-op until FLY_API_TOKEN is set -- see
+      # docs/DEPLOY.md for provisioning the Fly app, Postgres, and this
+      # secret. Nothing in this workflow runs `fly launch` or creates any
+      # Fly resource.
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+        if: ${{ secrets.FLY_API_TOKEN != '' }}
+
+      - name: Deploy
+        if: ${{ secrets.FLY_API_TOKEN != '' }}
+        run: flyctl deploy --remote-only --wait-timeout 600
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Verify the deployed release is ready
+        if: ${{ secrets.FLY_API_TOKEN != '' }}
+        run: >-
+          curl --fail --silent --show-error --retry 5 --retry-delay 5
+          https://ledgerline.fly.dev/readyz
