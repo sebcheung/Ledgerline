@@ -45,6 +45,13 @@ dev = [
   "hypothesis>=6.112,<7",
   "testcontainers[postgres]>=4.8,<5",
 ]
+# Phase 7 (SPEC.md §12): a separate extra, not `dev` -- CI installs
+# `.[dev]` on every run, and locust's gevent-based dependency stack has no
+# business being in that install for a load test that's run manually
+# (see loadtest/README.md).
+loadtest = [
+  "locust>=2.31,<3",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["ledger", "worker", "dashboard"]
@@ -69,6 +76,17 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = "migrations.*"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+# loadtest/ is not part of the ledger/worker/dashboard wheel and is only
+# ever run manually (see loadtest/README.md); locust itself ships no type
+# stubs.
+module = "loadtest.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "locust.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
