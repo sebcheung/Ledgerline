@@ -23,6 +23,10 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://ledgerline:ledgerline@db:5432/ledgerline
       LOG_LEVEL: INFO
+      # The dashboard's "Run demo scenario" button (SPEC.md §12 Phase 6) --
+      # off by default everywhere else (ledger/config.py). Writes real
+      # transactions; never enable this against a ledger you care about.
+      DEMO_ENABLED: "true"
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && uvicorn ledger.api.main:app --host 0.0.0.0 --port 8000"
@@ -35,6 +39,12 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://ledgerline:ledgerline@db:5432/ledgerline
       LOG_LEVEL: INFO
+      # Short retry budget so the demo scenario's DLQ and pending retries
+      # are visible within seconds instead of hours -- configuration only,
+      # the production defaults in ledger/config.py are untouched.
+      WEBHOOK_MAX_ATTEMPTS: "3"
+      WEBHOOK_BASE_DELAY_SECONDS: "1"
+      WEBHOOK_MAX_DELAY_SECONDS: "30"
     command: python -m worker.webhook_worker
 
 volumes:

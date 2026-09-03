@@ -1,7 +1,6 @@
 """Dashboard HTML routes (SPEC.md §12 Phase 6): the full page, the
 per-panel fragment endpoints (a no-SSE degradation path, and what
-`dashboard/sse.py` renders from), and -- once `feature/demo-scenario` lands
--- the demo trigger.
+`dashboard/sse.py` renders from), the SSE stream, and the demo trigger.
 
 Deliberately thin: every query lives in `ledger.readmodels`
 (`dashboard/data.py` composes one context dict per panel), and every
@@ -12,13 +11,15 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from dashboard.data import PANEL_LOADERS
+from dashboard.demo import run_demo
 from dashboard.sse import StreamConfig, event_stream
 from dashboard.templating import templates
 from ledger.api.deps import SessionDep
 from ledger.config import get_settings
+from ledger.db.engine import engine as _ledger_engine
 from ledger.db.session import async_session_factory
 
 router = APIRouter()
@@ -36,6 +37,16 @@ def get_stream_config() -> StreamConfig:
         keepalive_seconds=settings.dashboard_sse_keepalive_seconds,
         max_stream_seconds=settings.dashboard_sse_max_stream_seconds,
     )
+
+
+def get_demo_engine() -> AsyncEngine:
+    """A dependency for the same reason `get_dashboard_session_factory`
+    exists: `run_demo` needs a real `AsyncEngine` (for
+    `ledger.reconciliation.runner.execute_run`'s failure-audit path and for
+    `Dispatcher`'s `engine.begin()` steps), and importing the module-level
+    production `engine` directly would touch it from every environment
+    including tests -- see `get_dashboard_session_factory`'s docstring."""
+    return _ledger_engine
 
 
 def get_dashboard_session_factory() -> async_sessionmaker[AsyncSession]:
@@ -92,3 +103,36 @@ async def sse(
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post("/demo", response_class=HTMLResponse, include_in_schema=False)
+async def demo(
+    request: Request,
+    session: SessionDep,
+    engine: Annotated[AsyncEngine, Depends(get_demo_engine)],
+) -> HTMLResponse:
+    # 404, not 403: a disabled feature shouldn't advertise that it exists at
+    # all. Checked here rather than by conditionally registering the route
+    # in create_app() -- `get_settings()` is already the single source of
+    # truth this whole module reads from, so there is no separate "is the
+    # route mounted" state to keep in sync with it.
+    if not get_settings().demo_enabled:
+        raise HTTPException(status_code=404, detail="the demo scenario is disabled")
+
+    result = await run_demo(session, engine)
+    if not result.ran:
+        context: dict[str, object] = {
+            "ok": False,
+            "message": "A demo scenario is already running -- try again shortly.",
+        }
+    else:
+        context = {
+            "ok": True,
+            "message": (
+                f"Demo scenario complete: {result.transactions_posted} transactions, "
+                f"{result.lines_ingested} settlement lines, "
+                f"{result.deliveries_dead} dead deliveries, "
+                f"{result.deliveries_pending} pending retries."
+            ),
+        }
+    return templates.TemplateResponse(request=request, name="partials/_toast.html", context=context)
