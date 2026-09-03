@@ -174,3 +174,11 @@ async def test_static_asset_is_served(app_client: AsyncClient) -> None:
     response = await app_client.get("/dashboard/static/vendor/htmx.min.js")
     assert response.status_code == 200
     assert "javascript" in response.headers["content-type"]
+
+
+async def test_demo_route_is_disabled_by_default(app_client: AsyncClient) -> None:
+    """`demo_enabled` defaults to `False` (`ledger/config.py`) -- a fresh
+    `app_client` must never be able to trigger a scenario that writes real
+    ledger rows."""
+    response = await app_client.post("/dashboard/demo")
+    assert response.status_code == 404
