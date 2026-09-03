@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, text
+from sqlalchemy import DateTime, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -11,6 +11,18 @@ from ledger.models.enums import IdempotencyStatus, pg_enum
 
 class IdempotencyKey(Base):
     __tablename__ = "idempotency_keys"
+    __table_args__ = (
+        # Phase 7 (SPEC.md §9, docs/DECISIONS.md): serves
+        # ledger.core.idempotency.sweep_idempotency_keys's
+        # `WHERE status = 'completed' AND created_at < ...` retention
+        # DELETE. Deliberately a plain index on created_at, not partial on
+        # status='completed' -- every row transitions to 'completed'
+        # eventually (see docs/DECISIONS.md), so a partial index would add
+        # write-time maintenance for no read-time benefit, and a future
+        # "reap abandoned in_progress rows" sweep would want the full index
+        # anyway.
+        Index("ix_idempotency_keys_created_at", "created_at"),
+    )
 
     key: Mapped[str] = mapped_column(String, primary_key=True)
     endpoint: Mapped[str] = mapped_column(String, nullable=False)
