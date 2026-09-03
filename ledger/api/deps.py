@@ -6,6 +6,7 @@ from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger.api.auth import require_api_key
+from ledger.api.ratelimit import enforce_rate_limit
 from ledger.db.session import get_session
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -15,7 +16,11 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 #: *not* applied via middleware or an allowlist -- see `ledger/api/auth.py`'s
 #: module docstring -- so `/healthz`, `/readyz`, `/metrics`, and
 #: `/dashboard/*` are unauthenticated by construction, not by exception.
-V1_DEPENDENCIES = [Depends(require_api_key)]
+#: `require_api_key` is listed explicitly even though `enforce_rate_limit`
+#: also depends on it -- FastAPI's per-request dependency cache runs it
+#: exactly once either way, and the order here documents that auth always
+#: resolves before rate limiting.
+V1_DEPENDENCIES = [Depends(require_api_key), Depends(enforce_rate_limit)]
 
 
 def get_idempotency_key(
