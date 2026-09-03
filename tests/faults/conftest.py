@@ -30,14 +30,23 @@ async def _clean_database(clean_database: None) -> None:
 
 @pytest_asyncio.fixture
 async def fault_client(
-    migrated_database_url: str, concurrency_engine: AsyncEngine
+    migrated_database_url: str, concurrency_engine: AsyncEngine, clean_database: None
 ) -> AsyncGenerator[AsyncClient, None]:
     """Same shape as `app_client` (tests/conftest.py), but bound to
     `concurrency_engine`'s NullPool instead of the default-pooled
     `db_engine`. The concurrent-duplicate fault test sends 20 simultaneous
     requests that must land on 20 genuinely separate Postgres backends --
     the default pool (5 + 10 overflow) would silently serialize most of
-    them and the test would pass without exercising SPEC.md §10's claim."""
+    them and the test would pass without exercising SPEC.md §10's claim.
+
+    Phase 7: seeds the same shared test API key as `app_client` and sends
+    it on every request, so the fault suite keeps exercising real auth
+    rather than being written against a bypassed dependency. Depends
+    explicitly on `clean_database` so the seed runs after the truncate."""
+    from tests.support.auth import TEST_API_KEY, seed_api_key
+
+    await seed_api_key(concurrency_engine, raw_key=TEST_API_KEY)
+
     from ledger.api.main import create_app
     from ledger.db.session import get_session
 
@@ -54,7 +63,11 @@ async def fault_client(
     app.dependency_overrides[get_session] = _override_get_session
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+    ) as client:
         yield client
 
 

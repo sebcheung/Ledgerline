@@ -24,6 +24,11 @@ async def _make_sse_client(
     from dashboard.views import get_dashboard_session_factory, get_stream_config
     from ledger.api.main import create_app
     from ledger.db.session import get_session
+    from tests.support.auth import TEST_API_KEY, seed_api_key
+
+    # Phase 7: one test in this module posts to `/v1/accounts`, which now
+    # requires a Bearer API key -- `/dashboard/*` itself stays unauthenticated.
+    await seed_api_key(db_engine, raw_key=TEST_API_KEY)
 
     session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
 
@@ -41,7 +46,11 @@ async def _make_sse_client(
         interval_seconds=0.0, keepalive_seconds=keepalive_seconds, max_events=max_events
     )
     transport = ASGITransport(app=app)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+    )
 
 
 @pytest_asyncio.fixture

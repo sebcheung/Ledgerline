@@ -290,6 +290,21 @@ class DeliveryNotRetryable(LedgerError):
     status = 409
 
 
+class Unauthenticated(LedgerError):
+    """Phase 7 (SPEC.md §9): covers every way `require_api_key` can fail --
+    a missing `Authorization` header, a non-Bearer scheme, an unknown key
+    hash, or a key with `active = false`. Deliberately one error type for
+    all four: a distinct "key revoked" response would let a caller probe
+    whether a guessed key was ever valid, which a payments API must not
+    leak. An extension URI -- SPEC.md §9's error table names only the 429
+    row for this phase."""
+
+    error_type = "/errors/unauthenticated"
+    title = "Unauthenticated"
+    status = 401
+    headers: ClassVar[Mapping[str, str]] = {"WWW-Authenticate": "Bearer"}
+
+
 class ReconciliationRunFailed(LedgerError):
     """SPEC.md §7: "call verify_global_balance() and fail the run loudly if
     it does not hold." A server-side invariant violation, not a client

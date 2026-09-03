@@ -1,17 +1,21 @@
-"""Shared FastAPI dependencies.
-
-No auth dependency here yet -- API key auth is Phase 7 (SPEC.md §12), and a
-stub would only need to be thrown away.
-"""
+"""Shared FastAPI dependencies."""
 
 from typing import Annotated
 
 from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ledger.api.auth import require_api_key
 from ledger.db.session import get_session
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+#: Phase 7 (SPEC.md §9): attached to every `/v1` router's `include_router(...,
+#: dependencies=V1_DEPENDENCIES)` call in `ledger/api/main.py`. Deliberately
+#: *not* applied via middleware or an allowlist -- see `ledger/api/auth.py`'s
+#: module docstring -- so `/healthz`, `/readyz`, `/metrics`, and
+#: `/dashboard/*` are unauthenticated by construction, not by exception.
+V1_DEPENDENCIES = [Depends(require_api_key)]
 
 
 def get_idempotency_key(
