@@ -22,12 +22,16 @@ def _alembic_config() -> Config:
     return cfg
 
 
-@router.get("/healthz")
+@router.get("/healthz", tags=["health"], summary="Liveness probe")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/readyz")
+@router.get(
+    "/readyz",
+    tags=["health"],
+    summary="Readiness probe: database connectivity and Alembic head check",
+)
 async def readyz(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
     # HTTPException.detail keys use `reason`, not `status` -- the RFC 7807
     # problem document reserves `status` for the integer HTTP status code,
