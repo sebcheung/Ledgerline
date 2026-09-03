@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     demo_retry_endpoint_url: str = "http://127.0.0.1:9/hook"
     demo_self_base_url: str = "http://127.0.0.1:8000"
 
+    # Used starting Phase 7 (API key auth, SPEC.md §9). No kill switch, by
+    # design: unlike rate limiting, disabling auth degrades security, not
+    # just availability, and this is a payments API (see docs/DECISIONS.md
+    # Phase 7). `0` disables only the cache, forcing every request to hit
+    # the database -- useful for immediate revocation.
+    api_key_cache_ttl_seconds: float = 30.0
+
 
 @lru_cache
 def get_settings() -> Settings:
