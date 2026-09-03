@@ -8,7 +8,7 @@ from ledger.core.invariants import verify_all_derivability, verify_global_balanc
 router = APIRouter()
 
 
-@router.get("/admin/verify")
+@router.get("/admin/verify", summary="Verify global balance and per-account derivability")
 async def verify(session: SessionDep) -> dict[str, Any]:
     """Runs invariants 3 (derivability) and 7 (global balance).
 

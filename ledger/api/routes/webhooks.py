@@ -25,6 +25,7 @@ from ledger.core.errors import DeliveryNotRetryable, WebhookDeliveryNotFound
 from ledger.models.enums import WebhookDeliveryStatus
 from ledger.models.webhooks import WebhookDelivery, WebhookEndpoint
 from ledger.schemas.pagination import Page, decode_cursor, encode_cursor
+from ledger.schemas.problems import Problem
 from ledger.schemas.webhooks import (
     WebhookDeliveryListQuery,
     WebhookDeliveryRead,
@@ -59,7 +60,16 @@ _DELIVERY_COLUMNS: tuple[InstrumentedAttribute[Any], ...] = (
 )
 
 
-@router.post("/webhooks/endpoints", response_model=WebhookEndpointCreated, status_code=201)
+@router.post(
+    "/webhooks/endpoints",
+    response_model=WebhookEndpointCreated,
+    status_code=201,
+    summary="Register a webhook endpoint",
+    description=(
+        "The signing secret is server-generated and returned exactly once, "
+        "in this response -- there is no endpoint to retrieve it again."
+    ),
+)
 async def create_endpoint(
     payload: WebhookEndpointCreate, session: SessionDep
 ) -> WebhookEndpointCreated:
@@ -80,7 +90,11 @@ async def create_endpoint(
     )
 
 
-@router.get("/webhooks/endpoints", response_model=Page[WebhookEndpointRead])
+@router.get(
+    "/webhooks/endpoints",
+    response_model=Page[WebhookEndpointRead],
+    summary="List registered webhook endpoints",
+)
 async def list_endpoints(
     session: SessionDep,
     query: Annotated[WebhookEndpointListQuery, Query()],
@@ -106,7 +120,11 @@ async def list_endpoints(
     return Page[WebhookEndpointRead](items=items, next_cursor=next_cursor, has_more=has_more)
 
 
-@router.get("/webhooks/deliveries", response_model=Page[WebhookDeliveryRead])
+@router.get(
+    "/webhooks/deliveries",
+    response_model=Page[WebhookDeliveryRead],
+    summary="List webhook deliveries, filtered by status or endpoint",
+)
 async def list_deliveries(
     session: SessionDep,
     query: Annotated[WebhookDeliveryListQuery, Query()],
@@ -134,7 +152,18 @@ async def list_deliveries(
     return Page[WebhookDeliveryRead](items=items, next_cursor=next_cursor, has_more=has_more)
 
 
-@router.post("/webhooks/deliveries/{delivery_id}/retry", response_model=WebhookDeliveryRead)
+@router.post(
+    "/webhooks/deliveries/{delivery_id}/retry",
+    response_model=WebhookDeliveryRead,
+    responses={
+        404: {"model": Problem, "description": "No webhook delivery with that id."},
+        409: {
+            "model": Problem,
+            "description": "The delivery is not dead, so there is nothing to replay.",
+        },
+    },
+    summary="Manually replay a dead-lettered webhook delivery",
+)
 async def retry_delivery(delivery_id: uuid.UUID, session: SessionDep) -> WebhookDeliveryRead:
     row = (
         await session.execute(
