@@ -157,10 +157,7 @@ async def concurrency_engine(migrated_database_url: str) -> AsyncGenerator[Async
     await engine.dispose()
 
 
-@pytest_asyncio.fixture
-async def app_client(
-    migrated_database_url: str, db_engine: AsyncEngine
-) -> AsyncGenerator[AsyncClient, None]:
+def _build_app_client(db_engine: AsyncEngine, *, headers: dict[str, str]) -> AsyncClient:
     from ledger.api.main import create_app
     from ledger.db.session import get_session
 
@@ -181,7 +178,35 @@ async def app_client(
     app.dependency_overrides[get_session] = _override_get_session
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    return AsyncClient(transport=transport, base_url="http://test", headers=headers)
+
+
+@pytest_asyncio.fixture
+async def app_client(
+    migrated_database_url: str, db_engine: AsyncEngine, clean_database: None
+) -> AsyncGenerator[AsyncClient, None]:
+    """Phase 7: every `/v1` route requires a Bearer API key, so this fixture
+    seeds one and sends it on every request -- existing tests written before
+    Phase 7 keep passing unchanged, and now genuinely exercise auth. Depends
+    explicitly on `clean_database` (rather than relying on autouse ordering)
+    so the seed provably runs after the truncate."""
+    from tests.support.auth import TEST_API_KEY, seed_api_key
+
+    await seed_api_key(db_engine, raw_key=TEST_API_KEY)
+    async with _build_app_client(
+        db_engine, headers={"Authorization": f"Bearer {TEST_API_KEY}"}
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def unauthenticated_client(
+    migrated_database_url: str, db_engine: AsyncEngine, clean_database: None
+) -> AsyncGenerator[AsyncClient, None]:
+    """Same app as `app_client`, but with no `Authorization` header --
+    for asserting the auth-failure shapes themselves
+    (`tests/integration/test_auth.py`)."""
+    async with _build_app_client(db_engine, headers={}) as client:
         yield client
 
 
