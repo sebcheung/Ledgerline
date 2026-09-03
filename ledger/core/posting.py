@@ -16,6 +16,7 @@ behind to accidentally get re-flushed later, because there are none.
 """
 
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from ledger.models.balances import AccountBalance
 from ledger.models.entries import Entry
 from ledger.models.enums import AccountType, EntryDirection, TransactionSource, TransactionStatus
 from ledger.models.transactions import Transaction
+from ledger.observability.metrics import ENTRIES_WRITTEN, POSTING_LATENCY, TRANSACTIONS_POSTED
 from ledger.webhooks.outbox import (
     EVENT_TRANSACTION_POSTED,
     EVENT_TRANSACTION_REVERSED,
@@ -248,6 +250,8 @@ async def post_transaction(
     delay to widen the window in which an incorrectly-ordered
     implementation would deadlock.
     """
+    started_at = time.perf_counter()
+
     # Step 1: shape validation.
     _validate_shape(entries)
     txn_currency = entries[0].currency
@@ -435,6 +439,9 @@ async def post_transaction(
             "idempotency_key": idempotency_key,
         },
     )
+    TRANSACTIONS_POSTED.inc()
+    ENTRIES_WRITTEN.inc(len(entries))
+    POSTING_LATENCY.observe(time.perf_counter() - started_at)
     return posted
 
 
