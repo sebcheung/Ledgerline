@@ -1,12 +1,75 @@
-# Placeholder — real deploy configuration lands in Phase 7.
+# Fly.io deploy configuration (SPEC.md §12 Phase 7).
+#
+# Deliberately not launched by this change -- no `fly launch`, no app or
+# managed Postgres created, no secrets set. See docs/DEPLOY.md for the
+# one-time manual steps and .github/workflows/cd.yml for the CD workflow
+# this config feeds.
 app = "ledgerline"
 primary_region = "iad"
 
 [build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  # "migrations on release" (SPEC.md §12): runs in a temporary machine with
+  # the app's env/secrets attached, before any traffic shifts to the new
+  # release. A non-zero exit aborts the deploy outright -- /readyz's
+  # existing alembic-head check (ledger/api/health.py) is the second,
+  # continuous layer behind this one-shot gate.
+  release_command = "alembic upgrade head"
+  strategy = "rolling"
+
+# Two process groups sharing one image (the Dockerfile's CMD is overridden
+# per group below). Without the `worker` group, ledger.webhooks.dispatcher
+# never runs in production and every webhook delivery stays `pending`
+# forever -- see docs/DECISIONS.md Phase 7.
+[processes]
+  app    = "uvicorn ledger.api.main:app --host 0.0.0.0 --port 8000 --workers 1"
+  worker = "python -m worker.webhook_worker"
+
+[env]
+  ENVIRONMENT = "production"
+  LOG_LEVEL = "INFO"
+  DEMO_ENABLED = "false"
+  DASHBOARD_ENABLED = "true"
 
 [http_service]
+  processes = ["app"]
   internal_port = 8000
   force_https = true
   auto_stop_machines = false
   auto_start_machines = true
+  # Exactly one web machine, running exactly one uvicorn worker (see
+  # `--workers 1` above): the in-process rate limiter
+  # (ledger/api/ratelimit.py) and in-process metrics counters
+  # (ledger/observability/metrics.py) are both only correct for a single
+  # process. See docs/DECISIONS.md Phase 7.
   min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.http_checks]]
+    path = "/readyz"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "20s"
+
+[[vm]]
+  processes = ["app"]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[[vm]]
+  processes = ["worker"]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Scraped by Fly's built-in Prometheus over the private network -- see
+# ledger/api/routes/metrics.py for why GET /metrics is unauthenticated.
+[[metrics]]
+  port = 8000
+  path = "/metrics"
+  processes = ["app"]
