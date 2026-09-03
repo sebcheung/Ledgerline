@@ -72,21 +72,15 @@ known-first-party = ["ledger", "worker", "dashboard"]
 strict = true
 python_version = "3.12"
 plugins = ["pydantic.mypy"]
-
-[[tool.mypy.overrides]]
-module = "migrations.*"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-# loadtest/ is not part of the ledger/worker/dashboard wheel and is only
-# ever run manually (see loadtest/README.md); locust itself ships no type
-# stubs.
-module = "loadtest.*"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "locust.*"
-ignore_missing_imports = true
+# migrations/ and loadtest/ have no __init__.py, so mypy resolves their
+# files to bare top-level module names (e.g. "env", "locustfile") rather
+# than "migrations.env" / "loadtest.locustfile" -- a `[[tool.mypy.overrides]]
+# module = "migrations.*"` pattern silently never matches. `exclude` works
+# on file paths instead, so it isn't affected by that module-naming quirk.
+# loadtest/ is also not part of the ledger/worker/dashboard wheel and is
+# only ever run manually (see loadtest/README.md); locust itself ships no
+# type stubs.
+exclude = ["^migrations/", "^loadtest/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
