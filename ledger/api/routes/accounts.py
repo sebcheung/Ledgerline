@@ -18,6 +18,7 @@ from ledger.models.balances import AccountBalance
 from ledger.models.entries import Entry
 from ledger.schemas.accounts import AccountCreate, AccountRead, EntryRead
 from ledger.schemas.pagination import Page, decode_cursor, encode_cursor
+from ledger.schemas.problems import Problem
 
 router = APIRouter()
 
@@ -41,7 +42,12 @@ async def _find_clearing_account(session: AsyncSession, currency: str) -> uuid.U
     ).scalar_one_or_none()
 
 
-@router.post("/accounts", response_model=AccountRead, status_code=201)
+@router.post(
+    "/accounts",
+    response_model=AccountRead,
+    status_code=201,
+    summary="Create an account",
+)
 async def create_account(
     payload: AccountCreate, session: SessionDep, response: Response
 ) -> AccountRead:
@@ -112,7 +118,12 @@ async def create_account(
     )
 
 
-@router.get("/accounts/{account_id}", response_model=AccountRead)
+@router.get(
+    "/accounts/{account_id}",
+    response_model=AccountRead,
+    responses={404: {"model": Problem, "description": "No account with that id."}},
+    summary="Get an account, including its current balance",
+)
 async def get_account(account_id: uuid.UUID, session: SessionDep) -> AccountRead:
     row = (
         await session.execute(
@@ -148,7 +159,12 @@ async def get_account(account_id: uuid.UUID, session: SessionDep) -> AccountRead
     )
 
 
-@router.get("/accounts/{account_id}/entries", response_model=Page[EntryRead])
+@router.get(
+    "/accounts/{account_id}/entries",
+    response_model=Page[EntryRead],
+    responses={404: {"model": Problem, "description": "No account with that id."}},
+    summary="List an account's ledger entries, newest first",
+)
 async def list_account_entries(
     account_id: uuid.UUID, session: SessionDep, limit: int = 50, cursor: str | None = None
 ) -> Page[EntryRead]:
