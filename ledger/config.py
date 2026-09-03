@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +10,25 @@ class Settings(BaseSettings):
     database_url: str
     log_level: str = "INFO"
     environment: str = "development"
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _normalize_database_url(cls, value: str) -> str:
+        """Phase 7: `fly postgres attach` (and most managed-Postgres
+        providers) set `DATABASE_URL` in libpq form (`postgres://...` or
+        `postgresql://...`), but both `ledger.db.engine.create_engine` and
+        `migrations/env.py` feed this straight into
+        `create_async_engine`, which requires the `+asyncpg` driver --
+        without this normalization, the first deploy's `release_command`
+        (`alembic upgrade head`) fails before any traffic shifts. An
+        explicit `+driver` (anything already containing `+`) is left
+        untouched, so a locally configured `postgresql+psycopg://` (e.g.
+        for a one-off sync script) is never silently rewritten."""
+        if value.startswith("postgres://"):
+            return "postgresql+asyncpg://" + value[len("postgres://") :]
+        if value.startswith("postgresql://"):
+            return "postgresql+asyncpg://" + value[len("postgresql://") :]
+        return value
 
     # Used starting Phase 3 (idempotency layer). Defined here now so config
     # is a single settings surface for the whole project.
