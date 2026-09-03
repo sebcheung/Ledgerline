@@ -8,6 +8,7 @@ from ledger.api.health import router as health_router
 from ledger.api.ratelimit import RateLimiter
 from ledger.api.routes.accounts import router as accounts_router
 from ledger.api.routes.admin import router as admin_router
+from ledger.api.routes.metrics import router as metrics_router
 from ledger.api.routes.reconciliation import router as reconciliation_router
 from ledger.api.routes.settlements import router as settlements_router
 from ledger.api.routes.transactions import router as transactions_router
@@ -31,6 +32,10 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(RequestIdMiddleware)
     app.include_router(health_router)
+    # Phase 7: no V1_DEPENDENCIES -- /metrics is unauthenticated by
+    # construction, same as /healthz and /readyz (see
+    # ledger/api/routes/metrics.py).
+    app.include_router(metrics_router)
     app.include_router(
         accounts_router, prefix="/v1", tags=["accounts"], dependencies=V1_DEPENDENCIES
     )
