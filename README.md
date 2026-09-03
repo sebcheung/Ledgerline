@@ -18,6 +18,21 @@ Run tests (spins up a throwaway Postgres via testcontainers if `DATABASE_URL` is
 pytest
 ```
 
+## Dashboard
+
+A server-rendered live view of the ledger (Jinja2 + htmx, SSE for updates) at [http://localhost:8000/dashboard](http://localhost:8000/dashboard) — account balances, recent transactions, reconciliation run history and open findings, and the webhook delivery queue with per-delivery retry countdowns and DLQ depth.
+
+```bash
+docker compose up            # api + dashboard + webhook worker + db
+python -m scripts.seed       # accounts and a small transaction history
+```
+
+Panels refresh from `GET /dashboard/sse`, a `text/event-stream` endpoint that pushes a fresh snapshot every `DASHBOARD_SSE_INTERVAL_SECONDS` (default 2s) for whichever panels changed.
+
+### Demo scenario
+
+The **Run demo scenario** button (`POST /dashboard/demo`, also `python -m scripts.demo`) seeds a scenario with settlement drift and a webhook endpoint that fails, so reconciliation findings, auto-resolution, retry backoff, and the DLQ are all visible end to end. It is **disabled by default** — set `DEMO_ENABLED=true` (already set for the `app` service in `docker-compose.yml`). It writes real transactions; never enable it against a ledger you care about. Each click appends a new scenario rather than replacing the last one.
+
 ## Delivery semantics
 
 Webhook delivery is **at-least-once**: a worker crash mid-delivery is recovered by a stale-claim sweep that returns the delivery to `pending` for redelivery. Receivers must dedupe on the `X-Ledgerline-Event-Id` header.
