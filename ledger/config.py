@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     # the database -- useful for immediate revocation.
     api_key_cache_ttl_seconds: float = 30.0
 
+    # Used starting Phase 7 (rate limiting, SPEC.md §9): 100 req/s, burst
+    # 200, per API key, in-process (see docs/DECISIONS.md Phase 7 for the
+    # multi-worker caveat this implies for fly.toml). Unlike auth, a kill
+    # switch is defensible here -- it degrades availability, not security --
+    # and the Locust load test needs one for a clean, unthrottled run.
+    rate_limit_enabled: bool = True
+    rate_limit_rps: float = 100.0
+    rate_limit_burst: float = 200.0
+
 
 @lru_cache
 def get_settings() -> Settings:

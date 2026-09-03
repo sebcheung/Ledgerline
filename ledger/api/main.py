@@ -5,6 +5,7 @@ from ledger.api.auth import ApiKeyCache
 from ledger.api.deps import V1_DEPENDENCIES
 from ledger.api.errors import register_error_handlers
 from ledger.api.health import router as health_router
+from ledger.api.ratelimit import RateLimiter
 from ledger.api.routes.accounts import router as accounts_router
 from ledger.api.routes.admin import router as admin_router
 from ledger.api.routes.reconciliation import router as reconciliation_router
@@ -20,10 +21,14 @@ def create_app() -> FastAPI:
     configure_logging()
     settings = get_settings()
     app = FastAPI(title="Ledgerline")
-    # Phase 7: one cache per app instance, not a module-level global -- see
-    # `ledger.api.auth.ApiKeyCache`'s docstring. Every `create_app()` call in
-    # the test suite therefore starts with an empty cache.
+    # Phase 7: one instance per app, not a module-level global -- see
+    # `ApiKeyCache`'s and `RateLimiter`'s docstrings. Every `create_app()`
+    # call in the test suite therefore starts with an empty cache and full
+    # buckets, never inheriting state from another test's app.
     app.state.api_key_cache = ApiKeyCache(ttl_seconds=settings.api_key_cache_ttl_seconds)
+    app.state.rate_limiter = RateLimiter(
+        rate_per_second=settings.rate_limit_rps, burst=settings.rate_limit_burst
+    )
     app.add_middleware(RequestIdMiddleware)
     app.include_router(health_router)
     app.include_router(

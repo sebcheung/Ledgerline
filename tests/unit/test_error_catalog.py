@@ -15,8 +15,15 @@ _SPEC_URIS = {
     "/errors/account-not-found": 404,
     "/errors/idempotency-conflict": 409,
     "/errors/idempotency-key-reuse": 422,
-    # /errors/rate-limited is reserved for Phase 7; not yet raised anywhere.
+    "/errors/rate-limited": 429,
     "/errors/already-reversed": 409,
+}
+
+#: `RateLimited` takes a keyword-only `retry_after_seconds` the generic
+#: `cls("detail")` construction below can't supply -- every other
+#: `LedgerError` subclass takes only `detail` (plus optional `**extra`).
+_EXTRA_CONSTRUCTOR_KWARGS: dict[str, dict[str, object]] = {
+    "RateLimited": {"retry_after_seconds": 2.4},
 }
 
 
@@ -59,7 +66,8 @@ def test_extra_is_json_safe() -> None:
 
 def test_problem_headers_are_str_to_str() -> None:
     for cls in _all_ledger_error_subclasses():
-        headers = cls("detail").problem_headers()
+        kwargs = _EXTRA_CONSTRUCTOR_KWARGS.get(cls.__name__, {})
+        headers = cls("detail", **kwargs).problem_headers()
         assert isinstance(headers, dict)
         for key, value in headers.items():
             assert isinstance(key, str)
@@ -68,4 +76,14 @@ def test_problem_headers_are_str_to_str() -> None:
 
 def test_idempotency_conflict_sets_retry_after() -> None:
     exc = errors_module.DuplicateTransaction("in flight")
+    assert exc.problem_headers() == {"Retry-After": "1"}
+
+
+def test_rate_limited_computes_retry_after() -> None:
+    exc = errors_module.RateLimited("too many requests", retry_after_seconds=2.4)
+    assert exc.problem_headers() == {"Retry-After": "3"}
+
+
+def test_rate_limited_retry_after_is_floored_at_one_second() -> None:
+    exc = errors_module.RateLimited("too many requests", retry_after_seconds=0.01)
     assert exc.problem_headers() == {"Retry-After": "1"}

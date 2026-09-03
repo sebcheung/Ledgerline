@@ -11,6 +11,7 @@ dependency arrow points api -> core, so `ledger.reconciliation` and
 web framework.
 """
 
+import math
 import uuid
 from collections.abc import Mapping
 from typing import Any, ClassVar
@@ -303,6 +304,27 @@ class Unauthenticated(LedgerError):
     title = "Unauthenticated"
     status = 401
     headers: ClassVar[Mapping[str, str]] = {"WWW-Authenticate": "Bearer"}
+
+
+class RateLimited(LedgerError):
+    """SPEC.md §9 Phase 7: a per-key token bucket (`ledger.api.ratelimit`)
+    is exhausted. `retry_after_seconds` is the exact bucket-refill delay,
+    exposed via `problem_headers()` -- the dynamic-header hook
+    `LedgerError.headers`/`problem_headers()` was written for (see this
+    module's docstring). `Retry-After` is emitted as whole seconds per RFC
+    9110, ceiled and floored at 1 so a very short wait never renders as
+    `Retry-After: 0`, which would invite an immediate hot-retry loop."""
+
+    error_type = "/errors/rate-limited"
+    title = "Too Many Requests"
+    status = 429
+
+    def __init__(self, detail: str, *, retry_after_seconds: float, **extra: Any) -> None:
+        super().__init__(detail, **extra)
+        self._retry_after_seconds = max(1, math.ceil(retry_after_seconds))
+
+    def problem_headers(self) -> dict[str, str]:
+        return {**super().problem_headers(), "Retry-After": str(self._retry_after_seconds)}
 
 
 class ReconciliationRunFailed(LedgerError):
