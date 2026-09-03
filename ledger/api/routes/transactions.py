@@ -13,6 +13,7 @@ from ledger.models.enums import TransactionSource
 from ledger.models.transactions import Transaction
 from ledger.schemas.accounts import EntryRead
 from ledger.schemas.pagination import Page, decode_cursor, encode_cursor
+from ledger.schemas.problems import Problem
 from ledger.schemas.transactions import (
     TransactionCreate,
     TransactionListQuery,
@@ -86,7 +87,17 @@ async def _load_transaction_read(session: SessionDep, transaction_id: uuid.UUID)
     )
 
 
-@router.post("/transactions", response_model=TransactionRead, status_code=201)
+@router.post(
+    "/transactions",
+    response_model=TransactionRead,
+    status_code=201,
+    summary="Post a balanced, multi-leg transaction",
+    description=(
+        "Accepts an `Idempotency-Key` header (SPEC.md §6): a retry with the "
+        "same key and body replays the original response instead of posting "
+        "twice."
+    ),
+)
 async def create_transaction(
     payload: TransactionCreate,
     session: SessionDep,
@@ -116,12 +127,21 @@ async def create_transaction(
     return result.body
 
 
-@router.get("/transactions/{transaction_id}", response_model=TransactionRead)
+@router.get(
+    "/transactions/{transaction_id}",
+    response_model=TransactionRead,
+    responses={404: {"model": Problem, "description": "No transaction with that id."}},
+    summary="Get a transaction and its entries",
+)
 async def get_transaction(transaction_id: uuid.UUID, session: SessionDep) -> TransactionRead:
     return await _load_transaction_read(session, transaction_id)
 
 
-@router.get("/transactions", response_model=Page[TransactionSummary])
+@router.get(
+    "/transactions",
+    response_model=Page[TransactionSummary],
+    summary="List transactions, filtered by external ref, status, or date range",
+)
 async def list_transactions(
     session: SessionDep, query: Annotated[TransactionListQuery, Query()]
 ) -> Page[TransactionSummary]:
@@ -174,7 +194,15 @@ async def list_transactions(
 
 
 @router.post(
-    "/transactions/{transaction_id}/reverse", response_model=TransactionRead, status_code=201
+    "/transactions/{transaction_id}/reverse",
+    response_model=TransactionRead,
+    status_code=201,
+    responses={404: {"model": Problem, "description": "No transaction with that id."}},
+    summary="Reverse a posted transaction with the exact negation of its entries",
+    description=(
+        "Accepts an `Idempotency-Key` header, same semantics as "
+        "`POST /v1/transactions`. A transaction can only be reversed once."
+    ),
 )
 async def reverse(
     transaction_id: uuid.UUID,

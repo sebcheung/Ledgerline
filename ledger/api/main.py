@@ -1,3 +1,5 @@
+from importlib.metadata import PackageNotFoundError, version
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
@@ -5,6 +7,7 @@ from ledger.api.auth import ApiKeyCache
 from ledger.api.deps import V1_DEPENDENCIES
 from ledger.api.errors import register_error_handlers
 from ledger.api.health import router as health_router
+from ledger.api.openapi import APP_DESCRIPTION, PROBLEM_RESPONSES, TAGS_METADATA
 from ledger.api.ratelimit import RateLimiter
 from ledger.api.routes.accounts import router as accounts_router
 from ledger.api.routes.admin import router as admin_router
@@ -18,10 +21,25 @@ from ledger.observability.logging import configure_logging
 from ledger.observability.middleware import RequestIdMiddleware
 
 
+def _app_version() -> str:
+    try:
+        return version("ledgerline")
+    except PackageNotFoundError:
+        # e.g. running from a checkout without `pip install -e .` -- keep
+        # OpenAPI generation working rather than raising during startup.
+        return "0.0.0+unknown"
+
+
 def create_app() -> FastAPI:
     configure_logging()
     settings = get_settings()
-    app = FastAPI(title="Ledgerline")
+    app = FastAPI(
+        title="Ledgerline",
+        version=_app_version(),
+        description=APP_DESCRIPTION,
+        summary="An idempotent double-entry payments ledger and reconciliation engine.",
+        openapi_tags=TAGS_METADATA,
+    )
     # Phase 7: one instance per app, not a module-level global -- see
     # `ApiKeyCache`'s and `RateLimiter`'s docstrings. Every `create_app()`
     # call in the test suite therefore starts with an empty cache and full
@@ -37,23 +55,46 @@ def create_app() -> FastAPI:
     # ledger/api/routes/metrics.py).
     app.include_router(metrics_router)
     app.include_router(
-        accounts_router, prefix="/v1", tags=["accounts"], dependencies=V1_DEPENDENCIES
+        accounts_router,
+        prefix="/v1",
+        tags=["accounts"],
+        dependencies=V1_DEPENDENCIES,
+        responses=PROBLEM_RESPONSES,
     )
     app.include_router(
-        transactions_router, prefix="/v1", tags=["transactions"], dependencies=V1_DEPENDENCIES
+        transactions_router,
+        prefix="/v1",
+        tags=["transactions"],
+        dependencies=V1_DEPENDENCIES,
+        responses=PROBLEM_RESPONSES,
     )
-    app.include_router(admin_router, prefix="/v1", tags=["admin"], dependencies=V1_DEPENDENCIES)
     app.include_router(
-        settlements_router, prefix="/v1", tags=["settlements"], dependencies=V1_DEPENDENCIES
+        admin_router,
+        prefix="/v1",
+        tags=["admin"],
+        dependencies=V1_DEPENDENCIES,
+        responses=PROBLEM_RESPONSES,
+    )
+    app.include_router(
+        settlements_router,
+        prefix="/v1",
+        tags=["settlements"],
+        dependencies=V1_DEPENDENCIES,
+        responses=PROBLEM_RESPONSES,
     )
     app.include_router(
         reconciliation_router,
         prefix="/v1",
         tags=["reconciliation"],
         dependencies=V1_DEPENDENCIES,
+        responses=PROBLEM_RESPONSES,
     )
     app.include_router(
-        webhooks_router, prefix="/v1", tags=["webhooks"], dependencies=V1_DEPENDENCIES
+        webhooks_router,
+        prefix="/v1",
+        tags=["webhooks"],
+        dependencies=V1_DEPENDENCIES,
+        responses=PROBLEM_RESPONSES,
     )
     register_error_handlers(app)
 
