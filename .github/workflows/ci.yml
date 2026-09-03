@@ -43,4 +43,14 @@ jobs:
           path: .hypothesis
           key: hypothesis-${{ hashFiles('tests/property/**') }}
           restore-keys: hypothesis-
-      - run: pytest --cov=ledger --cov-report=term-missing --cov-fail-under=90
+      - run: pytest --cov=ledger --cov=dashboard --cov-report=term-missing --cov-fail-under=90
+      - name: Assert dashboard assets ship in the wheel
+        # Hatchling's packages = [...] ships the whole directory tree for a
+        # first-party package (templates, static/*, all file types) filtered
+        # only by VCS ignores -- an assumption worth pinning rather than
+        # trusting silently, since a future refactor (e.g. adding these
+        # paths to .gitignore) could break it without any test noticing.
+        run: |
+          pip wheel --no-deps -w /tmp/wh .
+          python -m zipfile -l /tmp/wh/*.whl | grep -q 'dashboard/templates/index.html'
+          python -m zipfile -l /tmp/wh/*.whl | grep -q 'dashboard/static/vendor/htmx.min.js'

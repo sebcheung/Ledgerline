@@ -95,7 +95,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["ledger"]
+source = ["ledger", "dashboard"]
 concurrency = ["greenlet", "thread"]
 
 [tool.coverage.report]
