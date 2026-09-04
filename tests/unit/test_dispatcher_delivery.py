@@ -5,6 +5,7 @@ these are pure branch assertions, not integration behavior."""
 import asyncio
 import random
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -23,6 +24,7 @@ def _row() -> ClaimedDelivery:
         secret="s",
         event_type="transaction.posted",
         payload={},
+        event_created_at=datetime.now(UTC),
     )
 
 

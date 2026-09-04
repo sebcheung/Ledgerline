@@ -25,10 +25,11 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select, text, true, update
+from sqlalchemy import DateTime, func, literal, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -36,6 +37,11 @@ from ledger.config import Settings, get_settings
 from ledger.models.enums import WebhookDeliveryStatus
 from ledger.models.outbox import OutboxEvent
 from ledger.models.webhooks import WebhookDelivery, WebhookEndpoint
+from ledger.observability.metrics import (
+    WEBHOOK_DELIVERY_ATTEMPTS,
+    WEBHOOK_DELIVERY_LATENCY,
+    WEBHOOK_STALE_CLAIMS_SWEPT,
+)
 from ledger.webhooks.signing import build_envelope, serialize_envelope, signature_header
 
 logger = logging.getLogger(__name__)
@@ -56,6 +62,11 @@ class ClaimedDelivery:
     secret: str
     event_type: str
     payload: dict[str, Any]
+    #: The outbox event's `created_at`, hydrated alongside `event_type`/
+    #: `payload` by `claim_batch`'s existing `OutboxEvent` join -- lets
+    #: `_record` observe `webhook_delivery_latency_seconds` from event
+    #: creation to successful delivery without a second query.
+    event_created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +76,9 @@ class DeliveryOutcome:
     response_code: int | None
     error: str | None
     retry_delay_seconds: float | None
+    #: Only populated on the SUCCEEDED branch -- the sole outcome `_record`
+    #: observes `webhook_delivery_latency_seconds` for.
+    event_created_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +217,7 @@ class Dispatcher:
                         WebhookEndpoint.secret,
                         OutboxEvent.event_type,
                         OutboxEvent.payload,
+                        OutboxEvent.created_at,
                     )
                     .select_from(WebhookDelivery)
                     .join(WebhookEndpoint, WebhookEndpoint.id == WebhookDelivery.endpoint_id)
@@ -221,6 +236,7 @@ class Dispatcher:
                 secret=r.secret,
                 event_type=r.event_type,
                 payload=r.payload,
+                event_created_at=r.created_at,
             )
             for r in rows
         ]
@@ -263,6 +279,7 @@ class Dispatcher:
                 response_code=code,
                 error=None,
                 retry_delay_seconds=None,
+                event_created_at=row.event_created_at,
             )
         if code == 429 or code >= 500:
             return self._retry_outcome(row, response_code=code, error=f"HTTP {code}")
@@ -316,15 +333,40 @@ class Dispatcher:
         async with self._engine.begin() as conn:
             for outcome in outcomes:
                 if outcome.status is WebhookDeliveryStatus.SUCCEEDED:
-                    await conn.execute(
-                        update(WebhookDelivery)
-                        .where(WebhookDelivery.id == outcome.delivery_id)
-                        .values(
-                            status=WebhookDeliveryStatus.SUCCEEDED,
-                            last_response_code=outcome.response_code,
-                            claimed_at=None,
+                    # func.now(), not datetime.now(): the module docstring's
+                    # "DB clock, not the app clock" rule -- lets fault tests
+                    # backdate OutboxEvent.created_at instead of sleeping to
+                    # exercise a nonzero latency observation. Computed in the
+                    # same UPDATE via RETURNING rather than a second query.
+                    assert outcome.event_created_at is not None
+                    latency_seconds = (
+                        await conn.execute(
+                            update(WebhookDelivery)
+                            .where(WebhookDelivery.id == outcome.delivery_id)
+                            .values(
+                                status=WebhookDeliveryStatus.SUCCEEDED,
+                                last_response_code=outcome.response_code,
+                                claimed_at=None,
+                            )
+                            .returning(
+                                func.extract(
+                                    "epoch",
+                                    func.now()
+                                    # Explicit `timestamptz` type: an untyped
+                                    # Python datetime literal defaults to
+                                    # SQLAlchemy's timezone-naive DateTime,
+                                    # which asyncpg then refuses to subtract
+                                    # from `now()`'s timestamptz.
+                                    - literal(
+                                        outcome.event_created_at,
+                                        type_=DateTime(timezone=True),
+                                    ),
+                                )
+                            )
                         )
-                    )
+                    ).scalar_one()
+                    WEBHOOK_DELIVERY_LATENCY.observe(float(latency_seconds))
+                    WEBHOOK_DELIVERY_ATTEMPTS.labels(outcome="succeeded").inc()
                     logger.info(
                         "webhook.delivered", extra={"delivery_id": str(outcome.delivery_id)}
                     )
@@ -340,6 +382,7 @@ class Dispatcher:
                             claimed_at=None,
                         )
                     )
+                    WEBHOOK_DELIVERY_ATTEMPTS.labels(outcome="dead").inc()
                     logger.warning(
                         "webhook.dead",
                         extra={
@@ -363,6 +406,7 @@ class Dispatcher:
                             claimed_at=None,
                         )
                     )
+                    WEBHOOK_DELIVERY_ATTEMPTS.labels(outcome="retried").inc()
                     logger.info(
                         "webhook.retry_scheduled",
                         extra={
@@ -399,6 +443,7 @@ class Dispatcher:
                 .all()
             )
         if swept_ids:
+            WEBHOOK_STALE_CLAIMS_SWEPT.inc(len(swept_ids))
             logger.warning("webhook.stale_claim_swept", extra={"count": len(swept_ids)})
         return len(swept_ids)
 

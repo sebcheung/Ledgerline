@@ -7,10 +7,13 @@ the difference, never an absolute value.
 """
 
 import uuid
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
+from prometheus_client import generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +26,7 @@ from ledger.models.enums import (
 from ledger.models.outbox import OutboxEvent
 from ledger.models.reconciliation import ReconciliationFinding, ReconciliationRun
 from ledger.models.webhooks import WebhookDelivery, WebhookEndpoint
+from ledger.observability.metrics import REGISTRY
 
 pytestmark = pytest.mark.integration
 
@@ -174,3 +178,46 @@ async def test_reconciliation_findings_gauge_reflects_findings_by_type(
     response = await app_client.get("/metrics")
     samples = _samples(response.text, "reconciliation_findings_total")
     assert samples[(("type", ReconciliationFindingType.MISSING_SETTLEMENT.value),)] >= 1
+
+
+class _BrokenSession:
+    """Stands in for a real `AsyncSession` whose connection is down --
+    every query `refresh_db_gauges` issues raises, exercising Phase 8
+    slice 1's "a DB outage must not turn /metrics into a 500" fix."""
+
+    async def execute(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("simulated database outage")
+
+    async def scalar(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("simulated database outage")
+
+
+async def test_metrics_endpoint_survives_a_db_outage_during_gauge_refresh() -> None:
+    """`refresh_db_gauges` must swallow the error, bump
+    `metrics_db_refresh_failures_total`, and let `GET /metrics` still
+    return 200 with whatever in-process counters it already has -- exactly
+    when an operator needs the endpoint most. A dependency override with a
+    session double that always raises is more direct than trying to sever
+    a real Postgres connection mid-test."""
+    from ledger.api.main import create_app
+    from ledger.db.session import get_session
+
+    async def _override_get_session() -> AsyncGenerator[_BrokenSession, None]:
+        yield _BrokenSession()
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _override_get_session
+
+    failures_before = _scalar(
+        generate_latest(REGISTRY).decode(), "metrics_db_refresh_failures_total"
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/metrics")
+
+    assert response.status_code == 200
+    text = response.text
+    assert "transactions_posted_total" in text
+    assert "entries_written_total" in text
+    assert _scalar(text, "metrics_db_refresh_failures_total") == failures_before + 1

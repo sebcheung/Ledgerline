@@ -16,6 +16,16 @@ _SPEC_NAMES = (
     "posting_latency_seconds",
 )
 
+#: Phase 8 slice 1 (docs/DECISIONS.md) additions.
+_PHASE_8_SLICE_1_NAMES = (
+    "webhook_stale_claims_swept_total",
+    "webhook_delivery_attempts_total",
+    "webhook_delivery_latency_seconds",
+    "outbox_lag_seconds",
+    "db_errors_total",
+    "metrics_db_refresh_failures_total",
+)
+
 
 def _exposition_text() -> str:
     return generate_latest(REGISTRY).decode()
@@ -25,6 +35,55 @@ def test_every_spec_metric_name_is_present() -> None:
     text = _exposition_text()
     for name in _SPEC_NAMES:
         assert f"# TYPE {name}" in text, f"missing metric {name!r}"
+
+
+def test_every_phase_8_slice_1_metric_name_is_present() -> None:
+    text = _exposition_text()
+    for name in _PHASE_8_SLICE_1_NAMES:
+        assert f"# TYPE {name}" in text, f"missing metric {name!r}"
+
+
+def test_webhook_stale_claims_swept_is_a_counter_with_no_labels() -> None:
+    text = _exposition_text()
+    assert "# TYPE webhook_stale_claims_swept_total counter" in text
+
+
+def test_webhook_delivery_attempts_is_a_counter_labelled_by_outcome() -> None:
+    from ledger.observability.metrics import WEBHOOK_DELIVERY_ATTEMPTS
+
+    text = _exposition_text()
+    assert "# TYPE webhook_delivery_attempts_total counter" in text
+    for outcome in ("succeeded", "retried", "dead"):
+        # Registering the label combination is enough to prove the
+        # labelname is exactly "outcome" -- a wrong labelname would raise
+        # here, not silently produce a different series.
+        WEBHOOK_DELIVERY_ATTEMPTS.labels(outcome=outcome)
+
+
+def test_webhook_delivery_latency_emits_histogram_components() -> None:
+    text = _exposition_text()
+    assert "# TYPE webhook_delivery_latency_seconds histogram" in text
+    assert "webhook_delivery_latency_seconds_bucket" in text
+    assert "webhook_delivery_latency_seconds_sum" in text
+    assert "webhook_delivery_latency_seconds_count" in text
+
+
+def test_outbox_lag_is_a_gauge_with_no_labels() -> None:
+    text = _exposition_text()
+    assert "# TYPE outbox_lag_seconds gauge" in text
+
+
+def test_db_errors_is_a_counter_labelled_by_operation() -> None:
+    from ledger.observability.metrics import DB_ERRORS
+
+    text = _exposition_text()
+    assert "# TYPE db_errors_total counter" in text
+    DB_ERRORS.labels(operation="select")  # would raise on a wrong labelname
+
+
+def test_metrics_db_refresh_failures_is_a_counter_with_no_labels() -> None:
+    text = _exposition_text()
+    assert "# TYPE metrics_db_refresh_failures_total counter" in text
 
 
 def test_reconciliation_findings_and_webhook_deliveries_declare_help_text() -> None:
