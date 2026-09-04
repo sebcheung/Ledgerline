@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import Any
 
 import httpx
-from sqlalchemy import DateTime, func, literal, select, text, true, update
+from sqlalchemy import DateTime, case, cast, func, literal, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 #: Text column; an unbounded exception message from a hostile or broken
 #: endpoint is a cheap way to bloat the table.
 MAX_LAST_ERROR_LENGTH = 2000
+
+#: `last_error` for a row `sweep_stale_claims` dead-letters after
+#: `webhook_max_reclaims` reclaims -- distinguishes this from a `last_error`
+#: set by `_record` after an observed receiver outcome (see
+#: `Dispatcher.sweep_stale_claims`).
+RECLAIM_EXHAUSTED_ERROR = "reclaimed too many times without a successful delivery observation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +265,20 @@ class Dispatcher:
         async with semaphore:
             try:
                 response = await self._client.post(row.url, content=body, headers=headers)
+            except asyncio.CancelledError:
+                # A `BaseException` in Python 3.8+ -- not caught by any of
+                # the `except Exception` clauses below. Raised when the
+                # dispatcher's task is cancelled (graceful shutdown/SIGTERM)
+                # while this delivery is in flight. The row was already
+                # marked `delivering` by `claim_batch` before this coroutine
+                # ever started, so `sweep_stale_claims` will reclaim it once
+                # `claimed_at` goes stale -- there is nothing to record here.
+                # Re-raise so `asyncio.gather` (without `return_exceptions=
+                # True`) propagates the cancellation up through `deliver()`
+                # and `run_once()`, which is correct shutdown behavior; a
+                # cancelled task's return value would be discarded anyway.
+                logger.warning("webhook.delivery_cancelled", extra={"delivery_id": str(row.id)})
+                raise
             except httpx.TimeoutException as exc:
                 return self._retry_outcome(row, response_code=None, error=_describe(exc))
             except httpx.TransportError as exc:
@@ -422,29 +442,67 @@ class Dispatcher:
         shrink the retry budget for a fault that was ours, not the
         receiver's. This is what makes delivery at-least-once rather than
         at-most-once: the event ID header lets receivers dedupe (see
-        README.md)."""
+        README.md).
+
+        `reclaim_count` is the separate budget that *does* get charged here:
+        a worker that reliably crashes mid-POST (e.g. a bad deploy that
+        segfaults right after the socket write) would otherwise never
+        accumulate an `attempt_count` and would be redelivered forever. Once
+        incrementing it would push it past `webhook_max_reclaims`, this
+        dead-letters the row in the same UPDATE instead of resetting it to
+        `pending` -- a CASE-based single statement rather than two, so the
+        reclaim count and the status it gates can never observe each other's
+        write half-applied."""
+        exhausted = WebhookDelivery.reclaim_count + 1 >= self._settings.webhook_max_reclaims
         async with self._engine.begin() as conn:
-            swept_ids = (
-                (
-                    await conn.execute(
-                        update(WebhookDelivery)
-                        .where(
-                            WebhookDelivery.status == WebhookDeliveryStatus.DELIVERING,
-                            WebhookDelivery.claimed_at
-                            < text("now() - make_interval(secs => :stale)").bindparams(
-                                stale=self._settings.webhook_stale_claim_seconds
-                            ),
-                        )
-                        .values(status=WebhookDeliveryStatus.PENDING, claimed_at=None)
-                        .returning(WebhookDelivery.id)
+            rows = (
+                await conn.execute(
+                    update(WebhookDelivery)
+                    .where(
+                        WebhookDelivery.status == WebhookDeliveryStatus.DELIVERING,
+                        WebhookDelivery.claimed_at
+                        < text("now() - make_interval(secs => :stale)").bindparams(
+                            stale=self._settings.webhook_stale_claim_seconds
+                        ),
                     )
+                    .values(
+                        reclaim_count=WebhookDelivery.reclaim_count + 1,
+                        # `cast(..., WebhookDelivery.status.type)`: asyncpg
+                        # refuses to bind a `CASE` expression's inferred
+                        # `text` result into a native-enum column without an
+                        # explicit cast, unlike a plain `.values(status=...)`
+                        # literal (SQLAlchemy already types that one from the
+                        # target column).
+                        status=cast(
+                            case(
+                                (exhausted, WebhookDeliveryStatus.DEAD),
+                                else_=WebhookDeliveryStatus.PENDING,
+                            ),
+                            WebhookDelivery.status.type,
+                        ),
+                        last_error=case(
+                            (exhausted, RECLAIM_EXHAUSTED_ERROR),
+                            else_=WebhookDelivery.last_error,
+                        ),
+                        claimed_at=None,
+                    )
+                    .returning(WebhookDelivery.id, WebhookDelivery.status)
                 )
-                .scalars()
-                .all()
-            )
+            ).all()
+        swept_ids = [r.id for r in rows]
+        dead_ids = [r.id for r in rows if r.status is WebhookDeliveryStatus.DEAD]
         if swept_ids:
             WEBHOOK_STALE_CLAIMS_SWEPT.inc(len(swept_ids))
             logger.warning("webhook.stale_claim_swept", extra={"count": len(swept_ids)})
+        if dead_ids:
+            WEBHOOK_DELIVERY_ATTEMPTS.labels(outcome="dead").inc(len(dead_ids))
+            logger.warning(
+                "webhook.reclaim_exhausted",
+                extra={
+                    "count": len(dead_ids),
+                    "delivery_ids": [str(i) for i in dead_ids],
+                },
+            )
         return len(swept_ids)
 
     async def run_once(self) -> DispatchCycle:

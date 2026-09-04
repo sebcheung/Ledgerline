@@ -44,6 +44,13 @@ class WebhookDelivery(Base, UUIDPKMixin, CreatedAtMixin):
         ForeignKey("webhook_endpoints.id"), nullable=False
     )
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    #: How many times `sweep_stale_claims` has reclaimed this row from a
+    #: worker that died mid-delivery. Deliberately separate from
+    #: `attempt_count` (which only counts observed receiver outcomes) --
+    #: this is what lets a worker that reliably crashes mid-POST eventually
+    #: be dead-lettered instead of redelivered forever (see
+    #: `Dispatcher.sweep_stale_claims`).
+    reclaim_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[WebhookDeliveryStatus] = mapped_column(
         pg_enum(WebhookDeliveryStatus, "webhook_delivery_status"),

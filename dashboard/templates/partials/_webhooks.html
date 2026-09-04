@@ -18,7 +18,7 @@
 {% if deliveries %}
 <table>
   <thead>
-    <tr><th>Event</th><th>Endpoint</th><th>Status</th><th>Attempt</th><th>Retry</th><th>Last error</th></tr>
+    <tr><th>Event</th><th>Endpoint</th><th>Status</th><th>Attempt</th><th>Reclaims</th><th>Retry</th><th>Last error</th></tr>
   </thead>
   <tbody>
     {% for d in deliveries %}
@@ -30,6 +30,7 @@
         {% if d.claim_is_stale %}<span class="badge badge-pending">stale claim</span>{% endif %}
       </td>
       <td>{{ d.attempt_count }}/{{ max_attempts }}</td>
+      <td>{{ d.reclaim_count }}/{{ max_reclaims }}</td>
       <td>
         <span class="countdown"
               data-seconds="{{ d.seconds_until_retry if d.seconds_until_retry is not none else '' }}">{{ d.seconds_until_retry | countdown }}</span>

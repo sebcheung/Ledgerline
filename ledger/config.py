@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     webhook_stale_claim_seconds: int = 60
     webhook_connect_timeout_seconds: float = 5.0
     webhook_read_timeout_seconds: float = 5.0
+    # How many times `sweep_stale_claims` will reclaim one row from a worker
+    # that died mid-delivery before giving up and dead-lettering it, rather
+    # than redelivering forever. Defaults to the same value as
+    # `webhook_max_attempts`: both are budgets on how many times this ledger
+    # is willing to keep trying one delivery, just triggered by a different
+    # kind of failure (an observed bad response vs. a worker that never
+    # observed anything at all).
+    webhook_max_reclaims: int = 8
 
     # Used starting Phase 6 (dashboard + demo scenario, SPEC.md §12).
     dashboard_enabled: bool = True

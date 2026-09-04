@@ -61,6 +61,7 @@ async def load_webhooks_context(session: AsyncSession) -> dict[str, object]:
         "summary": summary,
         "deliveries": deliveries,
         "max_attempts": settings.webhook_max_attempts,
+        "max_reclaims": settings.webhook_max_reclaims,
     }
 
 

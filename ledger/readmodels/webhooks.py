@@ -37,6 +37,7 @@ class DeliveryQueueRow:
     event_type: str
     status: WebhookDeliveryStatus
     attempt_count: int
+    reclaim_count: int
     next_attempt_at: datetime
     last_error: str | None
     last_response_code: int | None
@@ -100,6 +101,7 @@ async def load_delivery_queue(session: AsyncSession, limit: int) -> list[Deliver
             OutboxEvent.event_type,
             WebhookDelivery.status,
             WebhookDelivery.attempt_count,
+            WebhookDelivery.reclaim_count,
             WebhookDelivery.next_attempt_at,
             WebhookDelivery.last_error,
             WebhookDelivery.last_response_code,
@@ -125,6 +127,7 @@ async def load_delivery_queue(session: AsyncSession, limit: int) -> list[Deliver
             event_type=r.event_type,
             status=r.status,
             attempt_count=r.attempt_count,
+            reclaim_count=r.reclaim_count,
             next_attempt_at=r.next_attempt_at,
             last_error=r.last_error,
             last_response_code=r.last_response_code,
