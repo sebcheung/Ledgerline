@@ -44,6 +44,13 @@ dev = [
   "pytest-timeout>=2.3,<3",
   "hypothesis>=6.112,<7",
   "testcontainers[postgres]>=4.8,<5",
+  # Phase 8 slice 4: tests/unit/test_alert_rules.py parses ops/alerts.yml to
+  # cross-check its PromQL expressions against the registered metric names.
+  # Not a transitive dependency of anything else in this project as of this
+  # slice -- checked via `pip show` on every existing dependency before
+  # adding this rather than assuming it rides in for free.
+  "pyyaml>=6,<7",
+  "types-pyyaml>=6,<7",
 ]
 # Phase 7 (SPEC.md §12): a separate extra, not `dev` -- CI installs
 # `.[dev]` on every run, and locust's gevent-based dependency stack has no

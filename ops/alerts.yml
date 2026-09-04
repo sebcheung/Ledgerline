@@ -1,0 +1,172 @@
+# Phase 8 slice 4 (docs/DECISIONS.md): Prometheus alerting rules for the
+# metrics defined in ledger/observability/metrics.py. Validated in CI by
+# `promtool check rules` (structural/PromQL validity) and, for a handful of
+# the more false-positive-prone rules, `promtool test rules` against
+# ops/alerts_test.yml (behavioral: does the rule actually fire/not-fire
+# where we expect).
+#
+# `annotations.runbook_url` on every alert points at `docs/RUNBOOK.md#<alert
+# name, lowercased>` -- that file does not exist yet as of this slice. A
+# later Phase 8 slice must create docs/RUNBOOK.md with a `##` heading (or
+# explicit `{#anchor}`) whose auto-generated GitHub anchor matches each of
+# these fragments exactly, i.e. a heading text that lowercases to
+# "ledgerline<name>" with no punctuation other than what GitHub's anchor
+# slugifier already strips. Keep alert names free of hyphens/underscores so
+# "lowercase the name" is the entire anchor rule and nothing can drift.
+groups:
+  - name: ledgerline
+    rules:
+      # The webhook dispatcher/worker (worker/webhook_worker.py) has no HTTP
+      # server of its own to scrape or health-check on Fly -- outbox_lag_seconds
+      # (a Gauge refreshed from the outbox table at /metrics scrape time, per
+      # ledger/observability/metrics.py) is the only cross-process signal that
+      # it is still alive and fanning events out. A steadily growing lag means
+      # the worker has stopped making progress (crashed, deadlocked, or
+      # stuck) even though nothing HTTP-visible has failed.
+      - alert: LedgerlineWorkerStalled
+        expr: outbox_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Outbox events are not being fanned out"
+          description: >-
+            The oldest un-fanned-out outbox event is {{ $value }}s old,
+            above the 300s threshold, for at least 5 minutes. The webhook
+            worker likely stopped making progress.
+          runbook_url: "docs/RUNBOOK.md#ledgerlineworkerstalled"
+
+      # webhook_dlq_depth is a Gauge (scraped from the database), not a
+      # Counter -- delta() is the correct function for measuring a Gauge's
+      # net change over a window; increase() assumes counter semantics
+      # (resets-to-zero-on-decrease) and would overcount here whenever the
+      # DLQ is drained and re-grows within the window.
+      - alert: LedgerlineDLQGrowing
+        expr: delta(webhook_dlq_depth[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The webhook dead-letter queue is growing"
+          description: >-
+            webhook_dlq_depth grew by {{ $value }} over the last 15
+            minutes. Dead-lettered deliveries do not retry themselves and
+            need a human to inspect and replay them.
+          runbook_url: "docs/RUNBOOK.md#ledgerlinedlqgrowing"
+
+      # webhook_stale_claims_swept_total only increments when
+      # Dispatcher.sweep_stale_claims reclaims a delivery stuck in
+      # `delivering` (Phase 8 slice 1) -- this should happen rarely (a
+      # worker restart mid-delivery). A sustained non-zero rate over 10
+      # minutes, held for another 15, means the worker is crash-looping
+      # mid-delivery rather than occasionally recovering from one.
+      - alert: LedgerlineStaleClaimStorm
+        expr: rate(webhook_stale_claims_swept_total[10m]) > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Webhook worker is repeatedly reclaiming stale claims"
+          description: >-
+            webhook_stale_claims_swept_total has been increasing at
+            {{ $value }}/s for 15+ minutes. This is consistent with a
+            crash loop in the webhook worker rather than an isolated
+            restart.
+          runbook_url: "docs/RUNBOOK.md#ledgerlinestaleclaimstorm"
+
+      # webhook_delivery_attempts_total{outcome} is incremented by
+      # Dispatcher._record for every attempt (succeeded/retried/dead). A
+      # sustained majority of attempts landing in "retried" points at the
+      # receiver, not us -- outbound delivery is failing en masse.
+      - alert: LedgerlineDeliveryFailureRatio
+        expr: >-
+          sum(rate(webhook_delivery_attempts_total{outcome="retried"}[10m]))
+          /
+          sum(rate(webhook_delivery_attempts_total[10m]))
+          > 0.5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Most webhook delivery attempts are being retried"
+          description: >-
+            {{ $value | humanizePercentage }} of webhook delivery attempts
+            over the last 10 minutes ended in "retried", sustained for 10+
+            minutes. Likely a receiver-side outage.
+          runbook_url: "docs/RUNBOOK.md#ledgerlinedeliveryfailureratio"
+
+      # Phase 7's load test measured server-side p99 posting latency under
+      # 250ms; 1s is a 4x regression against that baseline. sum by (le) over
+      # the raw bucket counters is the standard histogram_quantile pattern
+      # (safe even with a single series, and correct if this ever scrapes
+      # more than one instance).
+      - alert: LedgerlinePostingLatencyHigh
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(posting_latency_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ledger posting latency p99 regression"
+          description: >-
+            p99 posting_transaction latency is {{ $value }}s, above the 1s
+            threshold, for 10+ minutes (Phase 7 load test baseline: p99
+            under 250ms).
+          runbook_url: "docs/RUNBOOK.md#ledgerlinepostinglatencyhigh"
+
+      # refresh_db_gauges (ledger/observability/metrics.py) swallows its own
+      # DB errors so a DB outage can't also take /metrics down, but that
+      # means every Gauge it maintains (webhook_deliveries_total,
+      # webhook_dlq_depth, reconciliation_findings_total, outbox_lag_seconds)
+      # is silently stale whenever this counter is incrementing. None of
+      # those gauges' own alerts can detect that on their own -- a stale
+      # gauge just looks quiet.
+      - alert: LedgerlineMetricsStale
+        expr: increase(metrics_db_refresh_failures_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Database-backed gauges are not refreshing"
+          description: >-
+            refresh_db_gauges has failed {{ $value }} time(s) in the last 5
+            minutes. webhook_deliveries_total, webhook_dlq_depth,
+            reconciliation_findings_total, and outbox_lag_seconds may be
+            stale.
+          runbook_url: "docs/RUNBOOK.md#ledgerlinemetricsstale"
+
+      # idempotency_conflicts_total increments whenever a request hits an
+      # in-flight idempotency key lock (ledger.core.posting). A low
+      # background rate is expected (legitimate concurrent retries); a
+      # sustained higher rate suggests a client retry storm or a lock that
+      # isn't being released.
+      - alert: LedgerlineIdempotencyConflictSpike
+        expr: rate(idempotency_conflicts_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated idempotency key conflict rate"
+          description: >-
+            idempotency_conflicts_total is increasing at {{ $value }}/s,
+            sustained for 10+ minutes. Likely a client retry storm or a
+            stuck idempotency lock.
+          runbook_url: "docs/RUNBOOK.md#ledgerlineidempotencyconflictspike"
+
+      # reconciliation_findings_total{type="missing_settlement"} (Gauge,
+      # scraped from reconciliation_findings; see
+      # ledger.models.enums.ReconciliationFindingType) never resolves
+      # itself -- resolution is an operator action recorded via
+      # ReconciliationResolution. Any non-zero value sustained for an hour
+      # is a ledger-authoritative discrepancy waiting on a human.
+      - alert: LedgerlineReconciliationUnresolved
+        expr: reconciliation_findings_total{type="missing_settlement"} > 0
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "Unresolved missing-settlement reconciliation findings"
+          description: >-
+            {{ $value }} missing_settlement reconciliation finding(s) have
+            been outstanding for over an hour.
+          runbook_url: "docs/RUNBOOK.md#ledgerlinereconciliationunresolved"
