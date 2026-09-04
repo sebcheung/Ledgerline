@@ -22,5 +22,9 @@ router = APIRouter()
 async def metrics(session: SessionDep) -> PlainTextResponse:
     if not get_settings().metrics_enabled:
         raise HTTPException(status_code=404)
+    # refresh_db_gauges (Phase 8 slice 1) swallows its own DB errors and
+    # falls back to each gauge's last-known value -- this call is never
+    # allowed to turn a DB outage into a 500 on the endpoint an operator
+    # needs most during one.
     await refresh_db_gauges(session)
     return PlainTextResponse(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
