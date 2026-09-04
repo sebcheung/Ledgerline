@@ -1,0 +1,219 @@
+# Phase 8 slice 4: `promtool test rules` unit tests for ops/alerts.yml.
+# Synthetic time series proving each alert fires when its threshold/duration
+# is crossed, plus explicit non-firing cases for the two rules most prone to
+# false positives (LedgerlineStaleClaimStorm, LedgerlineDeliveryFailureRatio)
+# where a single benign event must NOT trip the alert.
+#
+# rule_files is relative to this file's own directory -- CI and local runs
+# both invoke promtool with `-w ops` (or an equivalent cwd), see
+# .github/workflows/ci.yml and the promtool commands in this slice's report.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- LedgerlineWorkerStalled: outbox_lag_seconds > 300 for 5m ---
+  - interval: 1m
+    input_series:
+      - series: "outbox_lag_seconds"
+        values: "0 0 350+0x10"
+    alert_rule_test:
+      # Crosses 300 at t=2m; "for: 5m" means it must not yet be firing at
+      # t=6m (only 4 minutes sustained) but must be firing by t=7m.
+      - eval_time: 6m
+        alertname: LedgerlineWorkerStalled
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LedgerlineWorkerStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Outbox events are not being fanned out"
+              description: >-
+                The oldest un-fanned-out outbox event is 350s old,
+                above the 300s threshold, for at least 5 minutes. The
+                webhook worker likely stopped making progress.
+              runbook_url: "docs/RUNBOOK.md#ledgerlineworkerstalled"
+
+  # --- LedgerlineDLQGrowing: delta(webhook_dlq_depth[15m]) > 0 ---
+  - interval: 1m
+    input_series:
+      - series: "webhook_dlq_depth"
+        values: "0 0 0 0 0 1 2 3 4 5 5 5 5 5 5 5 5 5 5 5 5"
+    alert_rule_test:
+      # delta() over the trailing 15m window: at t=20m the window covers
+      # t=5m..t=20m, where the gauge rose from 0 to 5.
+      - eval_time: 20m
+        alertname: LedgerlineDLQGrowing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The webhook dead-letter queue is growing"
+              description: >-
+                webhook_dlq_depth grew by 3.2142857142857144 over the
+                last 15 minutes. Dead-lettered deliveries do not retry
+                themselves and need a human to inspect and replay
+                them.
+              runbook_url: "docs/RUNBOOK.md#ledgerlinedlqgrowing"
+
+  # --- LedgerlineStaleClaimStorm: sustained rate(...) > 0 for 15m ---
+  - interval: 1m
+    input_series:
+      # Steady crash loop: one stale claim swept every minute, forever.
+      - series: "webhook_stale_claims_swept_total"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LedgerlineStaleClaimStorm
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Webhook worker is repeatedly reclaiming stale claims"
+              description: >-
+                webhook_stale_claims_swept_total has been increasing at
+                0.016666666666666666/s for 15+ minutes. This is
+                consistent with a crash loop in the webhook worker
+                rather than an isolated restart.
+              runbook_url: "docs/RUNBOOK.md#ledgerlinestaleclaimstorm"
+  - interval: 1m
+    input_series:
+      # A single, isolated stale-claim sweep (e.g. one ordinary worker
+      # restart) -- the counter bumps once and never again. rate(...[10m])
+      # is only non-zero for the ~10m the event stays inside the range
+      # vector's window, well short of the 15m "for" duration, so this must
+      # never fire.
+      - series: "webhook_stale_claims_swept_total"
+        values: "0 0 0 1+0x25"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: LedgerlineStaleClaimStorm
+        exp_alerts: []
+
+  # --- LedgerlineDeliveryFailureRatio: retried-ratio > 0.5 for 10m ---
+  - interval: 1m
+    input_series:
+      # Retries make up 2/3 of all attempts, forever -- a sustained
+      # receiver-side outage.
+      - series: 'webhook_delivery_attempts_total{outcome="retried"}'
+        values: "0+2x20"
+      - series: 'webhook_delivery_attempts_total{outcome="succeeded"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LedgerlineDeliveryFailureRatio
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Most webhook delivery attempts are being retried"
+              description: >-
+                66.67% of webhook delivery attempts over
+                the last 10 minutes ended in "retried", sustained for
+                10+ minutes. Likely a receiver-side outage.
+              runbook_url: "docs/RUNBOOK.md#ledgerlinedeliveryfailureratio"
+  - interval: 1m
+    input_series:
+      # A short-lived burst of retries (minutes 5-9) that never sustains
+      # for the full 10m "for" duration before the retry rate falls back
+      # to zero -- must never fire, at any point.
+      - series: 'webhook_delivery_attempts_total{outcome="retried"}'
+        values: "0 0 0 0 0 5 10 15 20 25 25 25 25 25 25 25 25 25 25 25"
+      - series: 'webhook_delivery_attempts_total{outcome="succeeded"}'
+        values: "0+1x19"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: LedgerlineDeliveryFailureRatio
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: LedgerlineDeliveryFailureRatio
+        exp_alerts: []
+
+  # --- LedgerlinePostingLatencyHigh: p99 > 1s for 10m ---
+  - interval: 1m
+    input_series:
+      # No observations land at or below 1s; all land in (1, 2.5]. p99
+      # interpolates to ~2.485s, comfortably over the 1s threshold, and
+      # stays that way indefinitely.
+      - series: 'posting_latency_seconds_bucket{le="1"}'
+        values: "0x25"
+      - series: 'posting_latency_seconds_bucket{le="2.5"}'
+        values: "0+10x25"
+      - series: 'posting_latency_seconds_bucket{le="+Inf"}'
+        values: "0+10x25"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LedgerlinePostingLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Ledger posting latency p99 regression"
+              description: >-
+                p99 posting_transaction latency is 2.485s, above the 1s
+                threshold, for 10+ minutes (Phase 7 load test baseline:
+                p99 under 250ms).
+              runbook_url: "docs/RUNBOOK.md#ledgerlinepostinglatencyhigh"
+
+  # --- LedgerlineMetricsStale: increase(...) > 0 over 5m ---
+  - interval: 1m
+    input_series:
+      - series: "metrics_db_refresh_failures_total"
+        values: "0 0 0 1+0x10"
+    alert_rule_test:
+      # No "for" clause: fires as soon as the 5m window contains the bump.
+      - eval_time: 5m
+        alertname: LedgerlineMetricsStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Database-backed gauges are not refreshing"
+              description: >-
+                refresh_db_gauges has failed 1 time(s) in the last 5
+                minutes. webhook_deliveries_total, webhook_dlq_depth,
+                reconciliation_findings_total, and outbox_lag_seconds
+                may be stale.
+              runbook_url: "docs/RUNBOOK.md#ledgerlinemetricsstale"
+
+  # --- LedgerlineIdempotencyConflictSpike: rate(...) > 1/s for 10m ---
+  - interval: 1m
+    input_series:
+      # 400 new conflicts every minute is ~6.67/s, sustained.
+      - series: "idempotency_conflicts_total"
+        values: "0+400x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: LedgerlineIdempotencyConflictSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Elevated idempotency key conflict rate"
+              description: >-
+                idempotency_conflicts_total is increasing at
+                6.666666666666667/s, sustained for 10+ minutes. Likely
+                a client retry storm or a stuck idempotency lock.
+              runbook_url: "docs/RUNBOOK.md#ledgerlineidempotencyconflictspike"
+
+  # --- LedgerlineReconciliationUnresolved: finding > 0 for 1h ---
+  - interval: 1m
+    input_series:
+      - series: 'reconciliation_findings_total{type="missing_settlement"}'
+        values: "3+0x70"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: LedgerlineReconciliationUnresolved
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              type: missing_settlement
+            exp_annotations:
+              summary: "Unresolved missing-settlement reconciliation findings"
+              description: >-
+                3 missing_settlement reconciliation finding(s) have
+                been outstanding for over an hour.
+              runbook_url: "docs/RUNBOOK.md#ledgerlinereconciliationunresolved"

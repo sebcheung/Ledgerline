@@ -31,6 +31,18 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy .
+      # Phase 8 slice 4: validate ops/alerts.yml with promtool -- fast,
+      # dependency-free (no Postgres needed), so it belongs next to the
+      # other static checks rather than after the DB comes up. GH Actions
+      # ubuntu runners always have Docker preinstalled but not promtool
+      # itself, so this runs it via the official Prometheus image instead
+      # of downloading a standalone binary; pinned to a specific tag (not
+      # `:latest`) so a new Prometheus release can't change CI results out
+      # from under us.
+      - name: Validate Prometheus alerting rules
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD:/repo" prom/prometheus:v3.5.0 check rules /repo/ops/alerts.yml
+          docker run --rm --entrypoint promtool -v "$PWD/ops:/repo" -w /repo prom/prometheus:v3.5.0 test rules alerts_test.yml
       - run: alembic upgrade head
       # Prove the downgrade path (which drops the append-only trigger) works
       # before a later phase stacks another migration on top of it.
