@@ -45,6 +45,11 @@ services:
       WEBHOOK_MAX_ATTEMPTS: "3"
       WEBHOOK_BASE_DELAY_SECONDS: "1"
       WEBHOOK_MAX_DELAY_SECONDS: "30"
+    ports:
+      # This process's own webhook_stale_claims_swept_total/webhook_delivery_
+      # attempts_total/webhook_delivery_latency_seconds -- not visible on the
+      # app service's :8000/metrics (see docs/DECISIONS.md Phase 8).
+      - "9090:9090"
     command: python -m worker.webhook_worker
 
 volumes:

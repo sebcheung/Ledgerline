@@ -13,10 +13,12 @@ import logging
 import signal
 
 import httpx
+from prometheus_client import start_http_server
 
 from ledger.config import get_settings
 from ledger.db.engine import engine
 from ledger.observability.logging import configure_logging
+from ledger.observability.metrics import REGISTRY
 from ledger.webhooks.dispatcher import Dispatcher
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,16 @@ async def main() -> None:
     configure_logging()
     settings = get_settings()
     stop = asyncio.Event()
+
+    if settings.worker_metrics_enabled:
+        # This process's own Counters/Histogram (webhook_stale_claims_swept_
+        # total, webhook_delivery_attempts_total, webhook_delivery_latency_
+        # seconds) live only in this interpreter's copy of REGISTRY --
+        # GET /metrics on the app process cannot see them (see
+        # Settings.worker_metrics_port). start_http_server spawns its own
+        # background thread; it does not block this coroutine.
+        start_http_server(settings.worker_metrics_port, registry=REGISTRY)
+        logger.info("webhook_worker.metrics_started", extra={"port": settings.worker_metrics_port})
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

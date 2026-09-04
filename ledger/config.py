@@ -113,6 +113,19 @@ class Settings(BaseSettings):
     # Authorization header. This flag is the only way to turn it off.
     metrics_enabled: bool = True
 
+    # Phase 8: worker/webhook_worker.py has no ASGI app of its own, so
+    # GET /metrics (served only by the app process, per fly.toml's single
+    # `[[metrics]]` block) can never see the Counters/Histogram the
+    # dispatcher increments in that separate process -- Counter/Histogram
+    # state lives in each process's own Python interpreter and is never
+    # shared. This starts a second, minimal prometheus_client HTTP server
+    # inside the worker process itself, against the same
+    # ledger.observability.metrics.REGISTRY, so Fly can scrape it as a
+    # second target (see fly.toml's second `[[metrics]]` block). Same
+    # kill switch shape as metrics_enabled.
+    worker_metrics_enabled: bool = True
+    worker_metrics_port: int = 9090
+
     # Used starting Phase 7 (idempotency key retention sweep,
     # docs/DECISIONS.md Phase 3 and Phase 7). Run from a Fly scheduled
     # machine (python -m ledger.admin.sweep), not a background loop in this
