@@ -73,3 +73,16 @@ primary_region = "iad"
   port = 8000
   path = "/metrics"
   processes = ["app"]
+
+# Phase 8: a second, independent scrape target for the worker process's own
+# Counters/Histogram (webhook_stale_claims_swept_total, webhook_delivery_
+# attempts_total, webhook_delivery_latency_seconds) -- these are only ever
+# incremented inside worker/webhook_worker.py's interpreter, which the app
+# process's /metrics has no way to see (see docs/DECISIONS.md Phase 8).
+# worker/webhook_worker.py starts this server itself via
+# prometheus_client.start_http_server; no [http_service]/[[services]]
+# block is needed for Fly's private-network Prometheus to reach it.
+[[metrics]]
+  port = 9090
+  path = "/metrics"
+  processes = ["worker"]

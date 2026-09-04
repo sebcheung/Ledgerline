@@ -651,6 +651,9 @@ Live views: account balances, recent transactions, reconciliation run history an
 **Phase 7 — Deploy**
 API key auth, rate limiting, `/metrics`, OpenAPI descriptions, Fly.io deploy with managed Postgres, migrations on release, GitHub Actions CD on merge to main, Locust load test capturing throughput and p99 posting latency, README with architecture diagram.
 
+**Phase 8 — Reliability**
+Recovery metrics (stale-claim sweeps, delivery attempt outcomes and latency, outbox lag, DB error counts, metrics-refresh failures), Prometheus alert rules for every failure mode those metrics can detect, validated in CI with `promtool check`/`test rules` against a Docker-pinned Prometheus without deploying a live Prometheus/Alertmanager anywhere, `docs/RUNBOOK.md` covering detection/remediation/verification per alert plus rollback and migration-failure procedures, a chaos test suite proving crash recovery for both webhook worker crashes/cancellation mid-delivery and real Postgres backend loss (via `pg_terminate_backend`, not monkeypatched exceptions) mid-posting and mid-idempotent-claim, and `docs/CHAOS.md` recording the recovery numbers actually measured from both the automated suite and a live `docker compose` crash-and-restart run.
+
 ---
 
 ## 13. Conventions
