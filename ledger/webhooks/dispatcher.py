@@ -38,6 +38,7 @@ from ledger.models.enums import WebhookDeliveryStatus
 from ledger.models.outbox import OutboxEvent
 from ledger.models.webhooks import WebhookDelivery, WebhookEndpoint
 from ledger.observability.metrics import (
+    DB_ERRORS,
     WEBHOOK_DELIVERY_ATTEMPTS,
     WEBHOOK_DELIVERY_LATENCY,
     WEBHOOK_STALE_CLAIMS_SWEPT,
@@ -523,8 +524,24 @@ class Dispatcher:
         )
 
     async def run_forever(self, stop: asyncio.Event) -> None:
+        """Deliberately `except Exception`, not `except BaseException`: a
+        `asyncio.CancelledError` (raised into this coroutine on task
+        cancellation/SIGTERM-triggered shutdown) must still propagate and
+        exit the loop -- that is correct shutdown behavior, not a fault to
+        recover from. Everything else -- most importantly a
+        `sqlalchemy.exc.OperationalError` from a Postgres backend that
+        died or was terminated mid-`run_once` -- must not kill the worker
+        process permanently, since `worker/webhook_worker.py` awaits this
+        coroutine directly at the top level with nothing above it to
+        restart the loop. One bad cycle is logged, counted, and backed off
+        exactly like a normal poll interval before the next cycle tries
+        again."""
         while not stop.is_set():
-            await self.run_once()
+            try:
+                await self.run_once()
+            except Exception:
+                logger.error("webhook.run_once_failed", exc_info=True)
+                DB_ERRORS.labels(operation="dispatcher.run_once").inc()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
                     stop.wait(), timeout=self._settings.webhook_poll_interval_seconds
