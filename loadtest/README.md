@@ -46,8 +46,14 @@ domain operation SPEC.md §9 names.
 | Date | Where | Users | Duration | Throughput | p50 | p99 | 429 rate |
 |---|---|---|---|---|---|---|---|
 | 2026-09-03 | Local (Docker Desktop, Windows, shared-cpu dev machine), `docker compose`, rate limit disabled | 5 (ramp 5/s) | 15s | ~28 req/s aggregate | 39ms (all endpoints) | 130ms (`POST /v1/transactions`) | 0% |
+| 2026-09-03 | Local (Docker Desktop, Windows, shared-cpu dev machine), `docker compose`, rate limit disabled | 50 (ramp 10/s) | 60s | ~104 req/s aggregate | 320ms (all endpoints) | 670ms (all endpoints), 710ms (`POST /v1/transactions`) | 0% |
 
-This was a smoke run to prove the scenario exercises the shared-contention
-and replay paths end to end with zero failures, not a capacity benchmark --
-re-run at higher concurrency against a production-shaped deployment before
-treating these numbers as representative.
+The 50-user run's `posting_latency_seconds` histogram on `/metrics` for the
+same run put the domain operation itself (`ledger.core.posting.post_transaction`,
+excluding auth, rate limiting, and idempotency middleware) at p99 under
+250ms across 5458 postings -- the ~450ms gap to the end-to-end p99 above is
+that surrounding overhead, not the ledger write.
+
+Both runs are against a single-machine `docker compose` stack on a
+shared-cpu dev laptop, not a production-shaped deployment -- re-run against
+real infrastructure before treating either as a capacity ceiling.
