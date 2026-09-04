@@ -216,6 +216,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
-# Claude Code project-local config/skills -- useful locally, not for the repo
-.claude/
